@@ -9,7 +9,6 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
-        ref: 'main'
         path: 'kernel_source'
         fetch-depth: 1
 
