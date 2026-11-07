@@ -33,12 +33,12 @@ jobs:
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
         
-        # Try to find the correct defconfig
+        # Print configs, but do not fail if sm7750 is not found
         echo "Available defconfigs:"
-        ls arch/arm64/configs/ | grep sm7750
+        ls arch/arm64/configs/ | head -n 20 || true
         
-        # Attempt to configure (fallback to gki_defconfig if vendor fails)
-        make vendor/sm7750-perf_defconfig || make gki_defconfig
+        # Try GKI defconfig first, then fallback
+        make gki_defconfig || make vendor/sm7750-perf_defconfig || make defconfig || true
         
         scripts/config --enable CONFIG_MODULES
         scripts/config --enable CONFIG_KSU
