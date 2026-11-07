@@ -17,9 +17,13 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler
 
-    - name: Clone Prebuilt Clang Toolchain (r510928)
+    - name: Download Prebuilt Clang Toolchain (r510928)
       run: |
-        git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 ~/clang
+        mkdir -p ~/clang
+        cd ~/clang
+        # Download the specific tarball instead of git clone to avoid HTTP/2 errors
+        wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r510928.tar.gz"
+        tar -xzf clang-r510928.tar.gz
         
     - name: Integrate BakaSU
       working-directory: ./kernel_source
@@ -29,13 +33,9 @@ jobs:
     - name: Compile the Module
       working-directory: ./kernel_source
       run: |
-        export PATH=~/clang/clang-r510928/bin:$PATH
+        export PATH=~/clang/bin:$PATH
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
-        
-        # Print configs, but do not fail if sm7750 is not found
-        echo "Available defconfigs:"
-        ls arch/arm64/configs/ | head -n 20 || true
         
         # Try GKI defconfig first, then fallback
         make gki_defconfig || make vendor/sm7750-perf_defconfig || make defconfig || true
