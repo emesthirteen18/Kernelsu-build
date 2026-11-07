@@ -1,0 +1,47 @@
+name: Build KernelSU Module
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Nothing Kernel Source
+      uses: actions/checkout@v4
+      with:
+        repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
+        ref: 'main'
+        path: 'kernel_source'
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev python3 unzip curl wget
+
+    - name: Clone Prebuilt Clang Toolchain (r510928)
+      run: |
+        git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 ~/clang
+        
+    - name: Integrate BakaSU
+      working-directory: ./kernel_source
+      run: |
+        curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
+
+    - name: Compile the Module
+      working-directory: ./kernel_source
+      run: |
+        export PATH=~/clang/clang-r510928/bin:$PATH
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        
+        make vendor/sm7750-perf_defconfig
+        scripts/config --enable CONFIG_MODULES
+        scripts/config --enable CONFIG_KSU
+        scripts/config --set-val CONFIG_KSU m
+        
+        make -j$(nproc) modules
+
+    - name: Upload Compiling Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernelsu-module
+        path: kernel_source/drivers/kernelsu/kernelsu.ko
