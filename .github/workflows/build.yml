@@ -11,11 +11,12 @@ jobs:
         repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
         ref: 'main'
         path: 'kernel_source'
+        fetch-depth: 1
 
     - name: Install Build Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y git build-essential bc bison flex libssl-dev python3 unzip curl wget
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler
 
     - name: Clone Prebuilt Clang Toolchain (r510928)
       run: |
@@ -33,7 +34,13 @@ jobs:
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
         
-        make vendor/sm7750-perf_defconfig
+        # Try to find the correct defconfig
+        echo "Available defconfigs:"
+        ls arch/arm64/configs/ | grep sm7750
+        
+        # Attempt to configure (fallback to gki_defconfig if vendor fails)
+        make vendor/sm7750-perf_defconfig || make gki_defconfig
+        
         scripts/config --enable CONFIG_MODULES
         scripts/config --enable CONFIG_KSU
         scripts/config --set-val CONFIG_KSU m
