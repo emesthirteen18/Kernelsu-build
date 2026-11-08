@@ -63,12 +63,11 @@ jobs:
         echo "=== Verifying toolchain ==="
         which clang ld.lld llvm-nm llvm-objcopy llvm-readelf || true
 
-        echo "=== Available Defconfigs (We need this list!) ==="
-        ls -la arch/arm64/configs/vendor/ 2>/dev/null || ls -la arch/arm64/configs/ || true
-        echo "=== Searching for Nothing/SM7750 specific configs ==="
-        find arch/arm64/configs -name '*sm7750*' -o -name '*frogger*' -o -name '*nothing*' 2>/dev/null || true
+        echo "=== Available Defconfigs ==="
+        ls -la arch/arm64/configs/vendor/ || true
 
-        make defconfig
+        # Use the exact Nothing FroggerPro vendor config
+        make vendor/FroggerPro.config
 
         scripts/config --enable CONFIG_MODULES
         scripts/config --enable CONFIG_KSU
