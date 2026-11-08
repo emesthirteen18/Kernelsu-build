@@ -15,7 +15,7 @@ jobs:
     - name: Install Build Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler aria2
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler aria2 lld clang
 
     - name: Sparse Clone Prebuilt Clang Toolchain (r510928)
       run: |
@@ -27,6 +27,8 @@ jobs:
         echo "clang-r510928/*" >> .git/info/sparse-checkout
         git fetch --depth=1 origin master
         git checkout master
+        # Verify ld.lld exists
+        ls -l ~/clang/clang-r510928/bin/ld.lld || echo "ld.lld missing from prebuilt"
 
     - name: Integrate BakaSU
       working-directory: ./kernel_source
@@ -38,18 +40,25 @@ jobs:
       run: |
         export PATH=~/clang/clang-r510928/bin:$PATH
         export ARCH=arm64
-        export CLANG_TRIPLE=aarch64-linux-gnu-
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        export CC=clang
         export LLVM=1
         export LLVM_IAS=1
-        
-        make gki_defconfig || make vendor/sm7750-perf_defconfig || make defconfig || true
-        
+        export CC=clang
+        export LD=ld.lld
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJCOPY=llvm-objcopy
+        export OBJDUMP=llvm-objdump
+        export STRIP=llvm-strip
+        export HOSTCC=clang
+        export HOSTLD=ld.lld
+
+        # Prefer the vendor defconfig if it exists
+        make vendor/sm7750-perf_defconfig || make gki_defconfig || make defconfig
+
         scripts/config --enable CONFIG_MODULES
         scripts/config --enable CONFIG_KSU
         scripts/config --set-val CONFIG_KSU m
-        
+
         make -j$(nproc) modules
 
     - name: Upload Compiling Artifact
