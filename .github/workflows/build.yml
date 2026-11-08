@@ -62,17 +62,15 @@ jobs:
         echo "=== Verifying toolchain ==="
         which clang ld.lld llvm-nm llvm-objcopy llvm-readelf || true
 
-        # Base GKI config + vendor fragment
         make gki_defconfig
         scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
 
         scripts/config --enable CONFIG_MODULES
         scripts/config --enable CONFIG_KSU
         scripts/config --set-val CONFIG_KSU m
+        scripts/config --disable CONFIG_BLK_DEV_IO_TRACE
 
-        # Generate headers (including flask.h) before building modules
         make -j$(nproc) modules_prepare
-
         make -j$(nproc) modules
 
     - name: Upload Compiling Artifact
