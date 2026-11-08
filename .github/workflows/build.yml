@@ -17,15 +17,18 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler aria2
 
-    - name: Download Prebuilt Clang Toolchain (r510928)
+    - name: Sparse Clone Prebuilt Clang Toolchain (r510928)
       run: |
         mkdir -p ~/clang
         cd ~/clang
-        # Download ONLY the specific clang archive using curl with a browser user-agent
-        curl -L -A "Mozilla/5.0" -o clang-r510928.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r510928.tar.gz"
-        # Extract directly into ~/clang
-        tar -xzf clang-r510928.tar.gz
-        rm clang-r510928.tar.gz
+        # Initialize a sparse checkout to grab only the required toolchain folder
+        git init
+        git remote add origin https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+        git config core.sparseCheckout true
+        echo "clang-r510928/*" >> .git/info/sparse-checkout
+        # Fetch only the master branch, which contains the latest prebuilts
+        git fetch --depth=1 origin master
+        git checkout master
 
     - name: Integrate BakaSU
       working-directory: ./kernel_source
@@ -35,7 +38,7 @@ jobs:
     - name: Compile the Module
       working-directory: ./kernel_source
       run: |
-        export PATH=~/clang/bin:$PATH
+        export PATH=~/clang/clang-r510928/bin:$PATH
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
         
