@@ -15,15 +15,16 @@ jobs:
     - name: Install Build Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler aria2
 
     - name: Download Prebuilt Clang Toolchain (r510928)
       run: |
         mkdir -p ~/clang
         cd ~/clang
-        # Download the specific tarball instead of git clone to avoid HTTP/2 errors
-        wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r510928.tar.gz"
+        # Use aria2c with 16 connections to bypass server limits and avoid drops
+        aria2c -x 16 -s 16 -k 1M -o clang-r510928.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r510928.tar.gz"
         tar -xzf clang-r510928.tar.gz
+        rm clang-r510928.tar.gz
         
     - name: Integrate BakaSU
       working-directory: ./kernel_source
@@ -37,7 +38,6 @@ jobs:
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
         
-        # Try GKI defconfig first, then fallback
         make gki_defconfig || make vendor/sm7750-perf_defconfig || make defconfig || true
         
         scripts/config --enable CONFIG_MODULES
