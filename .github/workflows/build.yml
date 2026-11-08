@@ -34,7 +34,7 @@ jobs:
       run: |
         curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
-    - name: Compile the Module
+    - name: Compile the Module (Full Tree + Module.symvers)
       working-directory: ./kernel_source
       run: |
         if [ -x "$HOME/clang/clang-r510928/bin/clang" ] && [ -x "$HOME/clang/clang-r510928/bin/ld.lld" ]; then
@@ -59,19 +59,32 @@ jobs:
         export HOSTCC=clang
         export HOSTLD=ld.lld
 
-        echo "=== Verifying toolchain ==="
-        which clang ld.lld llvm-nm llvm-objcopy llvm-readelf || true
+        # 1. Remove the duplicate vendor hook from include/trace/hooks/blk.h (lines 51-54)
+        #    and ensure drivers/android/vendor_hooks.c has no duplicate export.
+        echo "=== Removing duplicate hooks ==="
+        sed -i '51,54d' include/trace/hooks/blk.h
+        awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
+          drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && \
+          mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
 
+        # 2. Configure kernel and merge FroggerPro fragment
         make gki_defconfig
         scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
 
+        # 3. Enable modules and set BakaSU to build as kernelsu.ko
         scripts/config --enable CONFIG_MODULES
-        scripts/config --enable CONFIG_KSU
         scripts/config --set-val CONFIG_KSU m
-        scripts/config --disable CONFIG_BLK_DEV_IO_TRACE
 
-        make -j$(nproc) modules_prepare
+        # 4. Resolve Kconfig tree before building
+        make -j$(nproc) olddefconfig
+
+        # 5. Build vmlinux and modules (This is the long step, ~15-20 mins)
         make -j$(nproc) modules
+
+        # 6. Strip debug info from kernelsu.ko to make it smaller
+        KSU_KO=$(find . -name "kernelsu.ko" | head -n 1)
+        llvm-strip -d "$KSU_KO"
+        ls -lh "$KSU_KO"
 
     - name: Upload Compiling Artifact
       uses: actions/upload-artifact@v4
