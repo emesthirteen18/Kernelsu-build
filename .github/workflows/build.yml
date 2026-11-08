@@ -17,19 +17,15 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler aria2
 
-    - name: Download and Extract Prebuilt Clang Toolchain
+    - name: Download Prebuilt Clang Toolchain (r510928)
       run: |
-        mkdir -p ~/clang_download
-        cd ~/clang_download
-        # Download the full android14-release branch archive
-        aria2c -x 16 -s 16 -k 1M -o android14-release.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release.tar.gz"
-        # Extract the entire archive
-        tar -xzf android14-release.tar.gz -C .
-        # Move the specific clang version to the expected location
         mkdir -p ~/clang
-        mv clang-r510928/* ~/clang/
         cd ~/clang
-        rm -rf ~/clang_download
+        # Download ONLY the specific clang archive using curl with a browser user-agent
+        curl -L -A "Mozilla/5.0" -o clang-r510928.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r510928.tar.gz"
+        # Extract directly into ~/clang
+        tar -xzf clang-r510928.tar.gz
+        rm clang-r510928.tar.gz
 
     - name: Integrate BakaSU
       working-directory: ./kernel_source
