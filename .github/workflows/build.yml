@@ -1,4 +1,3 @@
-#update
 name: Build KernelSU Module
 on: [push, workflow_dispatch]
 
@@ -38,7 +37,6 @@ jobs:
     - name: Compile the Module
       working-directory: ./kernel_source
       run: |
-        # Prefer the AOSP prebuilt; fall back to host LLVM if incomplete
         if [ -x "$HOME/clang/clang-r510928/bin/clang" ] && [ -x "$HOME/clang/clang-r510928/bin/ld.lld" ]; then
           export PATH="$HOME/clang/clang-r510928/bin:$PATH"
           echo "Using AOSP clang-r510928"
@@ -64,15 +62,16 @@ jobs:
         echo "=== Verifying toolchain ==="
         which clang ld.lld llvm-nm llvm-objcopy llvm-readelf || true
 
-        echo "=== Available Defconfigs ==="
-        ls -la arch/arm64/configs/vendor/ || true
-
-        # Use the exact Nothing FroggerPro vendor config
-        make vendor/FroggerPro.config
+        # Base GKI config + vendor fragment
+        make gki_defconfig
+        scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
 
         scripts/config --enable CONFIG_MODULES
         scripts/config --enable CONFIG_KSU
         scripts/config --set-val CONFIG_KSU m
+
+        # Generate headers (including flask.h) before building modules
+        make -j$(nproc) modules_prepare
 
         make -j$(nproc) modules
 
