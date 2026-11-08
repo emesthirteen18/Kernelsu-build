@@ -15,20 +15,19 @@ jobs:
     - name: Install Build Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler aria2 lld clang
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler aria2 lld clang llvm
 
     - name: Sparse Clone Prebuilt Clang Toolchain (r510928)
       run: |
-        mkdir -p ~/clang
-        cd ~/clang
+        mkdir -p $HOME/clang
+        cd $HOME/clang
         git init
         git remote add origin https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
         git config core.sparseCheckout true
         echo "clang-r510928/*" >> .git/info/sparse-checkout
         git fetch --depth=1 origin master
         git checkout master
-        # Verify ld.lld exists
-        ls -l ~/clang/clang-r510928/bin/ld.lld || echo "ld.lld missing from prebuilt"
+        ls -l $HOME/clang/clang-r510928/bin/ld.lld || echo "ld.lld missing from prebuilt"
 
     - name: Integrate BakaSU
       working-directory: ./kernel_source
@@ -38,7 +37,15 @@ jobs:
     - name: Compile the Module
       working-directory: ./kernel_source
       run: |
-        export PATH=~/clang/clang-r510928/bin:$PATH
+        # Prefer the AOSP prebuilt; fall back to host LLVM if incomplete
+        if [ -x "$HOME/clang/clang-r510928/bin/clang" ] && [ -x "$HOME/clang/clang-r510928/bin/ld.lld" ]; then
+          export PATH="$HOME/clang/clang-r510928/bin:$PATH"
+          echo "Using AOSP clang-r510928"
+        else
+          echo "AOSP prebuilt incomplete, using host LLVM"
+          export PATH="/usr/bin:$PATH"
+        fi
+
         export ARCH=arm64
         export LLVM=1
         export LLVM_IAS=1
@@ -49,11 +56,19 @@ jobs:
         export OBJCOPY=llvm-objcopy
         export OBJDUMP=llvm-objdump
         export STRIP=llvm-strip
+        export READELF=llvm-readelf
         export HOSTCC=clang
         export HOSTLD=ld.lld
 
-        # Prefer the vendor defconfig if it exists
-        make vendor/sm7750-perf_defconfig || make gki_defconfig || make defconfig
+        echo "=== Verifying toolchain ==="
+        which clang ld.lld llvm-nm llvm-objcopy llvm-readelf || true
+
+        echo "=== Available Defconfigs (We need this list!) ==="
+        ls -la arch/arm64/configs/vendor/ 2>/dev/null || ls -la arch/arm64/configs/ || true
+        echo "=== Searching for Nothing/SM7750 specific configs ==="
+        find arch/arm64/configs -name '*sm7750*' -o -name '*frogger*' -o -name '*nothing*' 2>/dev/null || true
+
+        make defconfig
 
         scripts/config --enable CONFIG_MODULES
         scripts/config --enable CONFIG_KSU
