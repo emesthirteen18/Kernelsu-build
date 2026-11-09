@@ -42,7 +42,6 @@ jobs:
         from pathlib import Path
 
         def apply_patch():
-            # Use drivers/kernelsu symlink so it works regardless of repo folder name
             ksu_dir = Path("drivers/kernelsu").resolve()
             kconfig_path = ksu_dir / "Kconfig"
             initc_path = ksu_dir / "core" / "init.c"
@@ -54,7 +53,6 @@ jobs:
                 print(f"ERROR: init.c not found at {initc_path}!")
                 sys.exit(1)
 
-            # 1. Patch Kconfig (depends only on KSU so olddefconfig never strips it)
             kconfig_text = kconfig_path.read_text()
             kconfig_anchor = 'menu "KernelSU"'
             if kconfig_anchor not in kconfig_text:
@@ -78,7 +76,6 @@ jobs:
             else:
                 print("Kconfig already patched.")
 
-            # 2. Patch init.c
             init_text = initc_path.read_text()
             anchor1 = 'pr_info("late load mode, skipping kprobe hooks\\n");'
             anchor2 = 'if (!getenforce()) {'
@@ -101,17 +98,14 @@ jobs:
                 )
                 init_text = init_text.replace(anchor1, patch1, 1)
 
-                # Place label BEFORE 'if (!getenforce()) {' (NOT inside its curly braces!)
                 patch2 = (
                     "#ifndef CONFIG_KSU_SAFE_LATE_LOAD\n"
                     "\t\t" + anchor2
                 )
                 init_text = init_text.replace(anchor2, patch2, 1)
 
-                # Place closing #endif and safe_late_done label right after setenforce(true); }
                 anchor3 = "setenforce(true);\n\t\t}"
                 if anchor3 not in init_text:
-                    # Fallback if indentation is 8 spaces instead of tabs
                     anchor3 = "setenforce(true);\n        }"
                 if anchor3 not in init_text:
                     print("ERROR: Could not find setenforce(true) block in init.c!")
@@ -131,7 +125,29 @@ jobs:
         PYEOF
         python3 /tmp/patch_ksu.py
 
-    - name: Compile the Module
+    - name: Create Dummy Module (For Kernel Stability Testing)
+      working-directory: ./kernel_source
+      run: |
+        mkdir -p drivers/dummy_mod
+        cat > drivers/dummy_mod/Makefile << 'EOF'
+        obj-m := dummy.o
+        EOF
+        cat > drivers/dummy_mod/dummy.c << 'EOF'
+        #include <linux/module.h>
+        #include <linux/kernel.h>
+        static int __init dummy_init(void) {
+            pr_info("DUMMY: Successfully inserted dummy module!\n");
+            return 0;
+        }
+        static void __exit dummy_exit(void) {
+            pr_info("DUMMY: Removed dummy module.\n");
+        }
+        module_init(dummy_init);
+        module_exit(dummy_exit);
+        MODULE_LICENSE("GPL");
+        EOF
+
+    - name: Compile the Modules
       working-directory: ./kernel_source
       run: |
         export PATH="$HOME/clang/clang-r510928/bin:$PATH"
@@ -167,13 +183,12 @@ jobs:
         scripts/config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
 
         make -j$(nproc) olddefconfig
-
-        # Verify the config actually applied before compiling
         grep -q "CONFIG_KSU_SAFE_LATE_LOAD=y" .config || { echo "ERROR: SAFE_LATE_LOAD config failed to apply!"; exit 1; }
 
         make -j$(nproc) modules_prepare
         make -j$(nproc) security/selinux/built-in.a
 
+        # Build Kernelsu
         KSU_DIR=$(realpath drivers/kernelsu)
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
           CONFIG_KSU=m \
@@ -182,18 +197,23 @@ jobs:
           KBUILD_MODPOST_WARN=1 \
           modules
 
-        llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
+        # Build Dummy
+        make -j$(nproc) M=drivers/dummy_mod modules
 
-        # Final verification that the string is in the compiled binary
+        llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
+        llvm-strip -d "drivers/dummy_mod/dummy.ko" || true
+
         strings "$KSU_DIR/kernelsu.ko" | grep -q "SAFE_LATE_LOAD" || { echo "ERROR: SAFE_LATE_LOAD not found in compiled .ko!"; exit 1; }
 
-        # Copy out of symlinked directory for clean artifact upload
         cp "$KSU_DIR/kernelsu.ko" ./kernelsu.ko
-        modinfo ./kernelsu.ko
-        ls -lh ./kernelsu.ko
+        cp "drivers/dummy_mod/dummy.ko" ./dummy.ko
 
-    - name: Upload Compiled Artifact
+        ls -lh ./kernelsu.ko ./dummy.ko
+
+    - name: Upload Compiled Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: kernelsu-module
-        path: kernel_source/kernelsu.ko
+        name: modules
+        path: |
+          kernel_source/kernelsu.ko
+          kernel_source/dummy.ko
