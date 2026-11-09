@@ -9,6 +9,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
+        ref: 'sm7750/b/FroggerPro'
         path: 'kernel_source'
         fetch-depth: 1
 
@@ -25,63 +26,112 @@ jobs:
         git remote add origin https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
         git config core.sparseCheckout true
         echo "clang-r510928/*" >> .git/info/sparse-checkout
-        git fetch --depth=1 origin master
-        git checkout master
+        git fetch --depth=1 origin main || git fetch --depth=1 origin master
+        git checkout FETCH_HEAD
 
     - name: Integrate BakaSU
       working-directory: ./kernel_source
       run: |
         curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
-    - name: Apply SAFE_LATE_LOAD Patch (Grok's Fix)
+    - name: Apply SAFE_LATE_LOAD Patch
       working-directory: ./kernel_source
       run: |
         cat > /tmp/patch_ksu.py << 'PYEOF'
-        import re
+        import sys
         from pathlib import Path
 
-        # 1. Patch Kconfig
-        kconfig = Path("KernelSU/kernel/Kconfig")
-        text = kconfig.read_text()
-        safe_config = """
-        config KSU_SAFE_LATE_LOAD
-        	bool "Safe late-load (skip aggressive init on non-GKI)"
-        	depends on KSU && KSU_TRACEPOINT_HOOK
-        	default n
-        	help
-        	  When late-loading the LKM, skip cred mutation, SELinux domain
-        	  escape, and full syscall-hook registration. Lets the module
-        	  load on kernels whose struct offsets / tracepoints diverge
-        	  from pure GKI (e.g. Nothing OS 4.1 / SM7750).
+        def apply_patch():
+            # Use drivers/kernelsu symlink so it works regardless of repo folder name
+            ksu_dir = Path("drivers/kernelsu").resolve()
+            kconfig_path = ksu_dir / "Kconfig"
+            initc_path = ksu_dir / "core" / "init.c"
 
-        config KSU_MANUAL_HOOK"""
-        text = text.replace("config KSU_MANUAL_HOOK", safe_config)
-        kconfig.write_text(text)
+            if not kconfig_path.exists():
+                print(f"ERROR: Kconfig not found at {kconfig_path}!")
+                sys.exit(1)
+            if not initc_path.exists():
+                print(f"ERROR: init.c not found at {initc_path}!")
+                sys.exit(1)
 
-        # 2. Patch init.c
-        initc = Path("KernelSU/kernel/core/init.c")
-        text = initc.read_text()
+            # 1. Patch Kconfig (depends only on KSU so olddefconfig never strips it)
+            kconfig_text = kconfig_path.read_text()
+            kconfig_anchor = 'menu "KernelSU"'
+            if kconfig_anchor not in kconfig_text:
+                print("ERROR: Could not find 'menu \"KernelSU\"' in Kconfig!")
+                sys.exit(1)
 
-        # Add the early jump
-        anchor1 = r'pr_info("late load mode, skipping kprobe hooks\n");'
-        patch1 = anchor1 + r"""
-        #ifdef CONFIG_KSU_SAFE_LATE_LOAD
-        		pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\n");
-        		ksu_boot_completed = true;
-        		goto safe_late_done;
-        #endif"""
-        text = text.replace(anchor1, patch1)
+            if "config KSU_SAFE_LATE_LOAD" not in kconfig_text:
+                safe_config = (
+                    'menu "KernelSU"\n\n'
+                    'config KSU_SAFE_LATE_LOAD\n'
+                    '\tbool "Safe late-load (skip aggressive init on OEM kernels)"\n'
+                    '\tdepends on KSU\n'
+                    '\tdefault y\n'
+                    '\thelp\n'
+                    '\t  When late-loading the LKM, skip cred mutation, SELinux domain\n'
+                    '\t  escape, and full syscall-hook registration.\n'
+                )
+                kconfig_text = kconfig_text.replace(kconfig_anchor, safe_config, 1)
+                kconfig_path.write_text(kconfig_text)
+                print("Successfully patched Kconfig.")
+            else:
+                print("Kconfig already patched.")
 
-        # Add the label
-        anchor2 = r'if (!getenforce()) {'
-        patch2 = anchor2 + "\nsafe_late_done:"
-        text = text.replace(anchor2, patch2)
-        initc.write_text(text)
-        print("Successfully applied SAFE_LATE_LOAD patch.")
+            # 2. Patch init.c
+            init_text = initc_path.read_text()
+            anchor1 = 'pr_info("late load mode, skipping kprobe hooks\\n");'
+            anchor2 = 'if (!getenforce()) {'
+
+            if anchor1 not in init_text:
+                print("ERROR: Could not find anchor1 in init.c!")
+                sys.exit(1)
+            if anchor2 not in init_text:
+                print("ERROR: Could not find anchor2 in init.c!")
+                sys.exit(1)
+
+            if "SAFE_LATE_LOAD" not in init_text:
+                patch1 = (
+                    anchor1 + "\n"
+                    "#ifdef CONFIG_KSU_SAFE_LATE_LOAD\n"
+                    '\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");\n'
+                    "\t\tksu_boot_completed = true;\n"
+                    "\t\tgoto safe_late_done;\n"
+                    "#endif"
+                )
+                init_text = init_text.replace(anchor1, patch1, 1)
+
+                # Place label BEFORE 'if (!getenforce()) {' (NOT inside its curly braces!)
+                patch2 = (
+                    "#ifndef CONFIG_KSU_SAFE_LATE_LOAD\n"
+                    "\t\t" + anchor2
+                )
+                init_text = init_text.replace(anchor2, patch2, 1)
+
+                # Place closing #endif and safe_late_done label right after setenforce(true); }
+                anchor3 = "setenforce(true);\n\t\t}"
+                if anchor3 not in init_text:
+                    # Fallback if indentation is 8 spaces instead of tabs
+                    anchor3 = "setenforce(true);\n        }"
+                if anchor3 not in init_text:
+                    print("ERROR: Could not find setenforce(true) block in init.c!")
+                    sys.exit(1)
+
+                init_text = init_text.replace(
+                    anchor3,
+                    anchor3 + "\n#endif\nsafe_late_done:\n\t\t;",
+                    1
+                )
+                initc_path.write_text(init_text)
+                print("Successfully patched init.c.")
+            else:
+                print("init.c already patched.")
+
+        apply_patch()
         PYEOF
         python3 /tmp/patch_ksu.py
 
-    - name: Compile the Module (Fast Targeted LKM Build)
+    - name: Compile the Module
       working-directory: ./kernel_source
       run: |
         export PATH="$HOME/clang/clang-r510928/bin:$PATH"
@@ -99,11 +149,9 @@ jobs:
         export HOSTCC=clang
         export HOSTLD=ld.lld
 
-        # Force exact vermagic localversion
         echo "-android15-8-g1a9b880d342b-ab15218529-4k" > .scmversion
-
-        # Kill the duplicate DECLARE_HOOK
         sed -i '51,54d' include/trace/hooks/blk.h
+
         awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
           drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && \
           mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
@@ -113,27 +161,39 @@ jobs:
 
         scripts/config --enable CONFIG_MODULES
         scripts/config --set-val CONFIG_KSU m
-        scripts/config --enable CONFIG_KSU_TRACEPOINT_HOOK
         scripts/config --enable CONFIG_KSU_SAFE_LATE_LOAD
         scripts/config --disable CONFIG_LOCALVERSION_AUTO
         scripts/config --set-str CONFIG_LOCALVERSION ""
-        scripts/config -d LTO_CLANG -e LTO_NONE
+        scripts/config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
 
         make -j$(nproc) olddefconfig
+
+        # Verify the config actually applied before compiling
+        grep -q "CONFIG_KSU_SAFE_LATE_LOAD=y" .config || { echo "ERROR: SAFE_LATE_LOAD config failed to apply!"; exit 1; }
+
         make -j$(nproc) modules_prepare
         make -j$(nproc) security/selinux/built-in.a
 
         KSU_DIR=$(realpath drivers/kernelsu)
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
           CONFIG_KSU=m \
+          CONFIG_KSU_SAFE_LATE_LOAD=y \
+          KCFLAGS="-DCONFIG_KSU_SAFE_LATE_LOAD=1" \
           KBUILD_MODPOST_WARN=1 \
           modules
 
         llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
-        ls -lh "$KSU_DIR/kernelsu.ko"
 
-    - name: Upload Compiling Artifact
+        # Final verification that the string is in the compiled binary
+        strings "$KSU_DIR/kernelsu.ko" | grep -q "SAFE_LATE_LOAD" || { echo "ERROR: SAFE_LATE_LOAD not found in compiled .ko!"; exit 1; }
+
+        # Copy out of symlinked directory for clean artifact upload
+        cp "$KSU_DIR/kernelsu.ko" ./kernelsu.ko
+        modinfo ./kernelsu.ko
+        ls -lh ./kernelsu.ko
+
+    - name: Upload Compiled Artifact
       uses: actions/upload-artifact@v4
       with:
         name: kernelsu-module
-        path: kernel_source/drivers/kernelsu/kernelsu.ko
+        path: kernel_source/kernelsu.ko
