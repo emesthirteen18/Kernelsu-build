@@ -34,14 +34,12 @@ jobs:
       run: |
         curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
-    - name: Compile the Module (Full Tree + Module.symvers)
+    - name: Compile the Module (Fast Targeted LKM Build)
       working-directory: ./kernel_source
       run: |
         if [ -x "$HOME/clang/clang-r510928/bin/clang" ] && [ -x "$HOME/clang/clang-r510928/bin/ld.lld" ]; then
           export PATH="$HOME/clang/clang-r510928/bin:$PATH"
-          echo "Using AOSP clang-r510928"
         else
-          echo "AOSP prebuilt incomplete, using host LLVM"
           export PATH="/usr/bin:$PATH"
         fi
 
@@ -59,32 +57,44 @@ jobs:
         export HOSTCC=clang
         export HOSTLD=ld.lld
 
-        # 1. Remove the duplicate vendor hook from include/trace/hooks/blk.h (lines 51-54)
-        #    and ensure drivers/android/vendor_hooks.c has no duplicate export.
-        echo "=== Removing duplicate hooks ==="
+        # 1. Kill the duplicate DECLARE_HOOK in include/trace/hooks/blk.h
+        echo "=== Removing duplicate hook ==="
         sed -i '51,54d' include/trace/hooks/blk.h
         awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
           drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && \
           mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
 
-        # 2. Configure kernel and merge FroggerPro fragment
+        # 2. Generate base GKI config and merge Nothing Phone (4a) Pro vendor fragment
         make gki_defconfig
         scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
 
-        # 3. Enable modules and set BakaSU to build as kernelsu.ko
+        # 3. Configure BakaSU as a loadable module (m) and disable LTO
         scripts/config --enable CONFIG_MODULES
         scripts/config --set-val CONFIG_KSU m
+        scripts/config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
 
-        # 4. Resolve Kconfig tree before building
+        # 4. Synchronize Kconfig dependencies
         make -j$(nproc) olddefconfig
 
-        # 5. Build vmlinux and modules (This is the long step, ~15-20 mins)
-        make -j$(nproc) modules
+        # 5. Prepare headers/scripts for external module compilation
+        make -j$(nproc) modules_prepare
 
-        # 6. Strip debug info from kernelsu.ko to make it smaller
-        KSU_KO=$(find . -name "kernelsu.ko" | head -n 1)
-        llvm-strip -d "$KSU_KO"
-        ls -lh "$KSU_KO"
+        # 6. Generate SELinux flask.h and av_permissions.h required by BakaSU
+        make -j$(nproc) security/selinux/built-in.a
+
+        # 7. Compile ONLY the BakaSU/KernelSU module directory
+        echo "=== Building targeted module ==="
+        KSU_DIR=$(realpath drivers/kernelsu)
+        make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
+          CONFIG_KSU=m \
+          KBUILD_MODPOST_WARN=1 \
+          modules
+
+        # 8. Strip debug symbols and verify output
+        echo "=== Stripping and verifying ==="
+        llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
+        ls -lh "$KSU_DIR/kernelsu.ko"
+        modinfo "$KSU_DIR/kernelsu.ko" | grep vermagic || true
 
     - name: Upload Compiling Artifact
       uses: actions/upload-artifact@v4
