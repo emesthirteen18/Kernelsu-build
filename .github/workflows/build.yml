@@ -27,22 +27,64 @@ jobs:
         echo "clang-r510928/*" >> .git/info/sparse-checkout
         git fetch --depth=1 origin master
         git checkout master
-        ls -l $HOME/clang/clang-r510928/bin/ld.lld || echo "ld.lld missing from prebuilt"
 
     - name: Integrate BakaSU
       working-directory: ./kernel_source
       run: |
         curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
+    - name: Apply SAFE_LATE_LOAD Patch (Grok's Fix)
+      working-directory: ./kernel_source
+      run: |
+        python3 - << 'PYEOF'
+        import re
+        from pathlib import Path
+
+        # 1. Patch Kconfig
+        kconfig = Path("KernelSU/kernel/Kconfig")
+        text = kconfig.read_text()
+        safe_config = """
+config KSU_SAFE_LATE_LOAD
+	bool "Safe late-load (skip aggressive init on non-GKI)"
+	depends on KSU && KSU_TRACEPOINT_HOOK
+	default n
+	help
+	  When late-loading the LKM, skip cred mutation, SELinux domain
+	  escape, and full syscall-hook registration. Lets the module
+	  load on kernels whose struct offsets / tracepoints diverge
+	  from pure GKI (e.g. Nothing OS 4.1 / SM7750).
+
+config KSU_MANUAL_HOOK"""
+        text = text.replace("config KSU_MANUAL_HOOK", safe_config)
+        kconfig.write_text(text)
+
+        # 2. Patch init.c
+        initc = Path("KernelSU/kernel/core/init.c")
+        text = initc.read_text()
+        
+        # Add the early jump
+        anchor1 = 'pr_info("late load mode, skipping kprobe hooks\\n");'
+        patch1 = anchor1 + """
+#ifdef CONFIG_KSU_SAFE_LATE_LOAD
+		pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");
+		ksu_boot_completed = true;
+		goto safe_late_done;
+#endif"""
+        text = text.replace(anchor1, patch1)
+        
+        # Add the label
+        anchor2 = 'if (!getenforce()) {'
+        patch2 = anchor2 + """
+safe_late_done:"""
+        text = text.replace(anchor2, patch2)
+        initc.write_text(text)
+        print("Successfully applied SAFE_LATE_LOAD patch.")
+        PYEOF
+
     - name: Compile the Module (Fast Targeted LKM Build)
       working-directory: ./kernel_source
       run: |
-        if [ -x "$HOME/clang/clang-r510928/bin/clang" ] && [ -x "$HOME/clang/clang-r510928/bin/ld.lld" ]; then
-          export PATH="$HOME/clang/clang-r510928/bin:$PATH"
-        else
-          export PATH="/usr/bin:$PATH"
-        fi
-
+        export PATH="$HOME/clang/clang-r510928/bin:$PATH"
         export ARCH=arm64
         export LLVM=1
         export LLVM_IAS=1
@@ -57,56 +99,39 @@ jobs:
         export HOSTCC=clang
         export HOSTLD=ld.lld
 
-        # 1. Force exact vermagic localversion (Qwen's fix)
-        echo "=== Creating .scmversion ==="
+        # Force exact vermagic localversion (Fixes the -dirty/+ issue)
         echo "-android15-8-g1a9b880d342b-ab15218529-4k" > .scmversion
 
-        # 2. Kill the duplicate DECLARE_HOOK in include/trace/hooks/blk.h
-        echo "=== Removing duplicate hook ==="
+        # Kill the duplicate DECLARE_HOOK in include/trace/hooks/blk.h
         sed -i '51,54d' include/trace/hooks/blk.h
         awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
           drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && \
           mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
 
-        # 3. Generate base GKI config and merge Nothing Phone (4a) Pro vendor fragment
         make gki_defconfig
         scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
 
-        # 4. Configure BakaSU as a loadable module (m) and disable LTO
         scripts/config --enable CONFIG_MODULES
         scripts/config --set-val CONFIG_KSU m
+        scripts/config --enable CONFIG_KSU_TRACEPOINT_HOOK
+        scripts/config --enable CONFIG_KSU_SAFE_LATE_LOAD
         scripts/config --disable CONFIG_LOCALVERSION_AUTO
         scripts/config --set-str CONFIG_LOCALVERSION ""
-        scripts/config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
+        scripts/config -d LTO_CLANG -e LTO_NONE
 
-        # 5. Synchronize Kconfig dependencies
         make -j$(nproc) olddefconfig
-
-        # 6. Prepare headers/scripts for external module compilation
         make -j$(nproc) modules_prepare
-
-        # 7. Generate SELinux flask.h and av_permissions.h required by BakaSU
         make -j$(nproc) security/selinux/built-in.a
 
-        # 8. Compile ONLY the BakaSU/KernelSU module directory
-        echo "=== Building targeted module ==="
+        # Compile ONLY the BakaSU/KernelSU module directory
         KSU_DIR=$(realpath drivers/kernelsu)
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
           CONFIG_KSU=m \
           KBUILD_MODPOST_WARN=1 \
           modules
 
-        # 9. Strip debug symbols
         llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
         ls -lh "$KSU_DIR/kernelsu.ko"
-
-        # 10. Verification (Qwen's checklist)
-        echo "=== VERMAGIC CHECK ==="
-        modinfo -F vermagic "$KSU_DIR/kernelsu.ko"
-        echo "=== VERSIONS SECTION CHECK ==="
-        readelf -S "$KSU_DIR/kernelsu.ko" | grep "__versions" || echo "no __versions section (Good for ksud)"
-        echo "=== SHN_UNDEF SYMBOLS CHECK ==="
-        readelf -s "$KSU_DIR/kernelsu.ko" | grep UND | head -n 5
 
     - name: Upload Compiling Artifact
       uses: actions/upload-artifact@v4
