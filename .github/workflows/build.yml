@@ -57,32 +57,38 @@ jobs:
         export HOSTCC=clang
         export HOSTLD=ld.lld
 
-        # 1. Kill the duplicate DECLARE_HOOK in include/trace/hooks/blk.h
+        # 1. Force exact vermagic localversion (Qwen's fix)
+        echo "=== Creating .scmversion ==="
+        echo "-android15-8-g1a9b880d342b-ab15218529-4k" > .scmversion
+
+        # 2. Kill the duplicate DECLARE_HOOK in include/trace/hooks/blk.h
         echo "=== Removing duplicate hook ==="
         sed -i '51,54d' include/trace/hooks/blk.h
         awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
           drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && \
           mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
 
-        # 2. Generate base GKI config and merge Nothing Phone (4a) Pro vendor fragment
+        # 3. Generate base GKI config and merge Nothing Phone (4a) Pro vendor fragment
         make gki_defconfig
         scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
 
-        # 3. Configure BakaSU as a loadable module (m) and disable LTO
+        # 4. Configure BakaSU as a loadable module (m) and disable LTO
         scripts/config --enable CONFIG_MODULES
         scripts/config --set-val CONFIG_KSU m
+        scripts/config --disable CONFIG_LOCALVERSION_AUTO
+        scripts/config --set-str CONFIG_LOCALVERSION ""
         scripts/config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
 
-        # 4. Synchronize Kconfig dependencies
+        # 5. Synchronize Kconfig dependencies
         make -j$(nproc) olddefconfig
 
-        # 5. Prepare headers/scripts for external module compilation
+        # 6. Prepare headers/scripts for external module compilation
         make -j$(nproc) modules_prepare
 
-        # 6. Generate SELinux flask.h and av_permissions.h required by BakaSU
+        # 7. Generate SELinux flask.h and av_permissions.h required by BakaSU
         make -j$(nproc) security/selinux/built-in.a
 
-        # 7. Compile ONLY the BakaSU/KernelSU module directory
+        # 8. Compile ONLY the BakaSU/KernelSU module directory
         echo "=== Building targeted module ==="
         KSU_DIR=$(realpath drivers/kernelsu)
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
@@ -90,11 +96,17 @@ jobs:
           KBUILD_MODPOST_WARN=1 \
           modules
 
-        # 8. Strip debug symbols and verify output
-        echo "=== Stripping and verifying ==="
+        # 9. Strip debug symbols
         llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
         ls -lh "$KSU_DIR/kernelsu.ko"
-        modinfo "$KSU_DIR/kernelsu.ko" | grep vermagic || true
+
+        # 10. Verification (Qwen's checklist)
+        echo "=== VERMAGIC CHECK ==="
+        modinfo -F vermagic "$KSU_DIR/kernelsu.ko"
+        echo "=== VERSIONS SECTION CHECK ==="
+        readelf -S "$KSU_DIR/kernelsu.ko" | grep "__versions" || echo "no __versions section (Good for ksud)"
+        echo "=== SHN_UNDEF SYMBOLS CHECK ==="
+        readelf -s "$KSU_DIR/kernelsu.ko" | grep UND | head -n 5
 
     - name: Upload Compiling Artifact
       uses: actions/upload-artifact@v4
