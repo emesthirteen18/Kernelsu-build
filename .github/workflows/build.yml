@@ -36,7 +36,7 @@ jobs:
     - name: Apply SAFE_LATE_LOAD Patch (Grok's Fix)
       working-directory: ./kernel_source
       run: |
-        python3 - << 'PYEOF'
+        cat > /tmp/patch_ksu.py << 'PYEOF'
         import re
         from pathlib import Path
 
@@ -44,42 +44,42 @@ jobs:
         kconfig = Path("KernelSU/kernel/Kconfig")
         text = kconfig.read_text()
         safe_config = """
-config KSU_SAFE_LATE_LOAD
-	bool "Safe late-load (skip aggressive init on non-GKI)"
-	depends on KSU && KSU_TRACEPOINT_HOOK
-	default n
-	help
-	  When late-loading the LKM, skip cred mutation, SELinux domain
-	  escape, and full syscall-hook registration. Lets the module
-	  load on kernels whose struct offsets / tracepoints diverge
-	  from pure GKI (e.g. Nothing OS 4.1 / SM7750).
+        config KSU_SAFE_LATE_LOAD
+        	bool "Safe late-load (skip aggressive init on non-GKI)"
+        	depends on KSU && KSU_TRACEPOINT_HOOK
+        	default n
+        	help
+        	  When late-loading the LKM, skip cred mutation, SELinux domain
+        	  escape, and full syscall-hook registration. Lets the module
+        	  load on kernels whose struct offsets / tracepoints diverge
+        	  from pure GKI (e.g. Nothing OS 4.1 / SM7750).
 
-config KSU_MANUAL_HOOK"""
+        config KSU_MANUAL_HOOK"""
         text = text.replace("config KSU_MANUAL_HOOK", safe_config)
         kconfig.write_text(text)
 
         # 2. Patch init.c
         initc = Path("KernelSU/kernel/core/init.c")
         text = initc.read_text()
-        
+
         # Add the early jump
-        anchor1 = 'pr_info("late load mode, skipping kprobe hooks\\n");'
-        patch1 = anchor1 + """
-#ifdef CONFIG_KSU_SAFE_LATE_LOAD
-		pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");
-		ksu_boot_completed = true;
-		goto safe_late_done;
-#endif"""
+        anchor1 = r'pr_info("late load mode, skipping kprobe hooks\n");'
+        patch1 = anchor1 + r"""
+        #ifdef CONFIG_KSU_SAFE_LATE_LOAD
+        		pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\n");
+        		ksu_boot_completed = true;
+        		goto safe_late_done;
+        #endif"""
         text = text.replace(anchor1, patch1)
-        
+
         # Add the label
-        anchor2 = 'if (!getenforce()) {'
-        patch2 = anchor2 + """
-safe_late_done:"""
+        anchor2 = r'if (!getenforce()) {'
+        patch2 = anchor2 + "\nsafe_late_done:"
         text = text.replace(anchor2, patch2)
         initc.write_text(text)
         print("Successfully applied SAFE_LATE_LOAD patch.")
         PYEOF
+        python3 /tmp/patch_ksu.py
 
     - name: Compile the Module (Fast Targeted LKM Build)
       working-directory: ./kernel_source
@@ -99,10 +99,10 @@ safe_late_done:"""
         export HOSTCC=clang
         export HOSTLD=ld.lld
 
-        # Force exact vermagic localversion (Fixes the -dirty/+ issue)
+        # Force exact vermagic localversion
         echo "-android15-8-g1a9b880d342b-ab15218529-4k" > .scmversion
 
-        # Kill the duplicate DECLARE_HOOK in include/trace/hooks/blk.h
+        # Kill the duplicate DECLARE_HOOK
         sed -i '51,54d' include/trace/hooks/blk.h
         awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
           drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && \
@@ -123,7 +123,6 @@ safe_late_done:"""
         make -j$(nproc) modules_prepare
         make -j$(nproc) security/selinux/built-in.a
 
-        # Compile ONLY the BakaSU/KernelSU module directory
         KSU_DIR=$(realpath drivers/kernelsu)
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
           CONFIG_KSU=m \
