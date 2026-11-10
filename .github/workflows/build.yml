@@ -150,6 +150,7 @@ jobs:
     - name: Compile the Modules
       working-directory: ./kernel_source
       run: |
+        export KBUILD_MODPOST_WARN=1
         export PATH="$HOME/clang/clang-r510928/bin:$PATH"
         export ARCH=arm64
         export LLVM=1
@@ -188,6 +189,9 @@ jobs:
         make -j$(nproc) modules_prepare
         make -j$(nproc) security/selinux/built-in.a
 
+        # Create an empty Module.symvers to satisfy modpost for the dummy module
+        touch Module.symvers
+
         # Build Kernelsu
         KSU_DIR=$(realpath drivers/kernelsu)
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
@@ -197,7 +201,7 @@ jobs:
           KBUILD_MODPOST_WARN=1 \
           modules
 
-        # Build Dummy
+        # Build Dummy (Now inherits the exported KBUILD_MODPOST_WARN=1)
         make -j$(nproc) M=drivers/dummy_mod modules
 
         llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
