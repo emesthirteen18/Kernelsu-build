@@ -188,8 +188,6 @@ jobs:
 
         make -j$(nproc) modules_prepare
         make -j$(nproc) security/selinux/built-in.a
-
-        # Create an empty Module.symvers to satisfy modpost for the dummy module
         touch Module.symvers
 
         # Build Kernelsu
@@ -198,10 +196,11 @@ jobs:
           CONFIG_KSU=m \
           CONFIG_KSU_SAFE_LATE_LOAD=y \
           KCFLAGS="-DCONFIG_KSU_SAFE_LATE_LOAD=1" \
+          CFLAGS_MODULE="-mcmodel=large" \
           KBUILD_MODPOST_WARN=1 \
           modules
 
-        # Build Dummy (Now inherits the exported KBUILD_MODPOST_WARN=1)
+        # Build Dummy
         make -j$(nproc) M=drivers/dummy_mod modules
 
         llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
