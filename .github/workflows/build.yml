@@ -180,8 +180,6 @@ jobs:
         scripts/config --enable CONFIG_MODULES
         scripts/config --enable CONFIG_MODULE_UNLOAD
         scripts/config --disable CONFIG_MODULE_SIG
-        # Note: We keep CONFIG_MODVERSIONS=y (default) to match the running kernel
-        # and avoid `module_layout` CRC mismatches.
         scripts/config --set-val CONFIG_KSU m
         scripts/config --enable CONFIG_KSU_SAFE_LATE_LOAD
         scripts/config --disable CONFIG_JUMP_LABEL
@@ -190,10 +188,24 @@ jobs:
         scripts/config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
 
         make -j$(nproc) olddefconfig
-        
-        # Verify configs applied
-        grep -q "CONFIG_KSU_SAFE_LATE_LOAD=y" .config || { echo "ERROR: SAFE_LATE_LOAD failed"; exit 1; }
-        grep -q "CONFIG_JUMP_LABEL" .config && { echo "ERROR: JUMP_LABEL not disabled"; exit 1; } || true
+
+        # Second disable in case olddefconfig re-enabled it via Kconfig select
+        scripts/config --disable CONFIG_JUMP_LABEL
+        make -j$(nproc) olddefconfig
+
+        # ---- Verification (fixed) ----
+        echo "[CHECK] SAFE_LATE_LOAD ..."
+        grep -q "^CONFIG_KSU_SAFE_LATE_LOAD=y" .config || { echo "ERROR: SAFE_LATE_LOAD not enabled"; exit 1; }
+        echo "[+] SAFE_LATE_LOAD=y"
+
+        echo "[CHECK] JUMP_LABEL state ..."
+        if grep -q "^CONFIG_JUMP_LABEL=y" .config; then
+            echo "ERROR: CONFIG_JUMP_LABEL=y — module will contain __jump_table and R_AARCH64_PREL32 overflow"
+            echo "Full JUMP_LABEL line:"
+            grep "JUMP_LABEL" .config
+            exit 1
+        fi
+        echo "[+] CONFIG_JUMP_LABEL is disabled (no __jump_table, no PREL32 overflow)"
 
         make -j$(nproc) modules_prepare
         make -j$(nproc) security/selinux/built-in.a
@@ -208,13 +220,23 @@ jobs:
           KBUILD_MODPOST_WARN=1 \
           modules
 
-        # Dummy module for isolation testing
         make -j$(nproc) M=drivers/dummy_mod modules
 
         llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
         llvm-strip -d "drivers/dummy_mod/dummy.ko" || true
 
         strings "$KSU_DIR/kernelsu.ko" | grep -q "SAFE_LATE_LOAD" || { echo "ERROR: SAFE_LATE_LOAD missing from .ko"; exit 1; }
+
+        # Verify __jump_table actually disappeared from the compiled binary
+        echo "[CHECK] __jump_table in compiled .ko ..."
+        if readelf -SW "$KSU_DIR/kernelsu.ko" | grep -q "__jump_table"; then
+            SIZE=$(readelf -SW "$KSU_DIR/kernelsu.ko" | grep "__jump_table" | awk '{print $6}')
+            if [ "$SIZE" != "000000" ] && [ "$SIZE" != "0" ]; then
+                echo "ERROR: __jump_table still present in module, size=$SIZE"
+                exit 1
+            fi
+        fi
+        echo "[+] __jump_table absent or size 0 in .ko"
 
         cp "$KSU_DIR/kernelsu.ko" ./kernelsu.ko
         cp "drivers/dummy_mod/dummy.ko" ./dummy.ko
