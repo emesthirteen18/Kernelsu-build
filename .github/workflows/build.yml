@@ -176,21 +176,29 @@ jobs:
         make gki_defconfig
         scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
 
+        # Critical module + jump label config
         scripts/config --enable CONFIG_MODULES
+        scripts/config --enable CONFIG_MODULE_UNLOAD
+        scripts/config --disable CONFIG_MODULE_SIG
+        # Note: We keep CONFIG_MODVERSIONS=y (default) to match the running kernel
+        # and avoid `module_layout` CRC mismatches.
         scripts/config --set-val CONFIG_KSU m
         scripts/config --enable CONFIG_KSU_SAFE_LATE_LOAD
+        scripts/config --disable CONFIG_JUMP_LABEL
         scripts/config --disable CONFIG_LOCALVERSION_AUTO
         scripts/config --set-str CONFIG_LOCALVERSION ""
         scripts/config -d LTO_CLANG -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
 
         make -j$(nproc) olddefconfig
-        grep -q "CONFIG_KSU_SAFE_LATE_LOAD=y" .config || { echo "ERROR: SAFE_LATE_LOAD config failed to apply!"; exit 1; }
+        
+        # Verify configs applied
+        grep -q "CONFIG_KSU_SAFE_LATE_LOAD=y" .config || { echo "ERROR: SAFE_LATE_LOAD failed"; exit 1; }
+        grep -q "CONFIG_JUMP_LABEL" .config && { echo "ERROR: JUMP_LABEL not disabled"; exit 1; } || true
 
         make -j$(nproc) modules_prepare
         make -j$(nproc) security/selinux/built-in.a
         touch Module.symvers
 
-        # Build Kernelsu
         KSU_DIR=$(realpath drivers/kernelsu)
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
           CONFIG_KSU=m \
@@ -200,17 +208,16 @@ jobs:
           KBUILD_MODPOST_WARN=1 \
           modules
 
-        # Build Dummy
+        # Dummy module for isolation testing
         make -j$(nproc) M=drivers/dummy_mod modules
 
         llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
         llvm-strip -d "drivers/dummy_mod/dummy.ko" || true
 
-        strings "$KSU_DIR/kernelsu.ko" | grep -q "SAFE_LATE_LOAD" || { echo "ERROR: SAFE_LATE_LOAD not found in compiled .ko!"; exit 1; }
+        strings "$KSU_DIR/kernelsu.ko" | grep -q "SAFE_LATE_LOAD" || { echo "ERROR: SAFE_LATE_LOAD missing from .ko"; exit 1; }
 
         cp "$KSU_DIR/kernelsu.ko" ./kernelsu.ko
         cp "drivers/dummy_mod/dummy.ko" ./dummy.ko
-
         ls -lh ./kernelsu.ko ./dummy.ko
 
     - name: Upload Compiled Artifacts
