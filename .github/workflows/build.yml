@@ -14,9 +14,15 @@ on:
         default: 'main'
         type: string
 
+env:
+  KSU_REPO: BakaSU/KernelSU
+  CLANG_VERSION: r510928
+  BUILD_TOOLS_VERSION: linux-x86
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
@@ -28,11 +34,10 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      - name: Checkout KernelSU/BakaSU
+      - name: Checkout KernelSU (BakaSU)
         uses: actions/checkout@v4
         with:
-          # Replace with your actual BakaSU fork repository if different
-          repository: BakaSU/KernelSU 
+          repository: ${{ env.KSU_REPO }}
           ref: ${{ inputs.ksu_ref }}
           path: KernelSU
           fetch-depth: 0
@@ -40,30 +45,30 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y repo bc cpio flex bison libssl-dev libelf-dev ccache python3 zip
+          sudo apt-get install -y repo bc cpio flex bison libssl-dev libelf-dev ccache python3 zip wget git
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           max-size: 5G
 
-      - name: Download and Extract AOSP Clang Toolchain
+      - name: Download AOSP Clang Toolchain
         run: |
-          # r510928 is the standard toolchain for GKI 6.6
-          CLANG_VERSION="r510928"
-          echo "Downloading Clang ${CLANG_VERSION}..."
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${CLANG_VERSION}.tar.gz -O clang.tar.gz
           mkdir -p $GITHUB_WORKSPACE/toolchain
-          tar -xzf clang.tar.gz -C $GITHUB_WORKSPACE/toolchain
+          cd $GITHUB_WORKSPACE/toolchain
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${CLANG_VERSION}.tar.gz -O clang.tar.gz
+          tar -xzf clang.tar.gz
           rm clang.tar.gz
-          
-          echo "Downloading Build-Tools..."
-          wget -q https://android.googlesource.com/platform/prebuilts/build-tools/+archive/refs/heads/main/linux-x86.tar.gz -O build-tools.tar.gz
-          mkdir -p $GITHUB_WORKSPACE/toolchain/build-tools
-          tar -xzf build-tools.tar.gz -C $GITHUB_WORKSPACE/toolchain/build-tools
+
+      - name: Download AOSP Build-Tools
+        run: |
+          cd $GITHUB_WORKSPACE/toolchain
+          wget -q https://android.googlesource.com/platform/prebuilts/build-tools/+archive/refs/heads/main/${BUILD_TOOLS_VERSION}.tar.gz -O build-tools.tar.gz
+          mkdir -p build-tools
+          tar -xzf build-tools.tar.gz -C build-tools
           rm build-tools.tar.gz
 
-      - name: Sync Kernel Source
+      - name: Sync AOSP Kernel Source
         run: |
           mkdir -p $GITHUB_WORKSPACE/kernel_source
           cd $GITHUB_WORKSPACE/kernel_source
@@ -71,38 +76,37 @@ jobs:
           repo init --depth=1 --u https://android.googlesource.com/kernel/manifest \
             -b common-${{ inputs.kernel_version }} --repo-rev=v2.16
           repo sync -c -j$(nproc --all) --no-tags --fail-fast
-            
-      - name: Integrate KernelSU Driver & Dummy Module
+
+      - name: Integrate KernelSU and Dummy Module
         run: |
           cd $GITHUB_WORKSPACE/kernel_source
           
-          # Create dummy module (seen in your previous build logs)
-          mkdir -p common/drivers/dummy_mod
-          cat << 'EOF' > common/drivers/dummy_mod/Makefile
-obj-m += dummy.o
-EOF
-          cat << 'EOF' > common/drivers/dummy_mod/dummy.c
-#include <linux/module.h>
-#include <linux/kernel.h>
-static int __init dummy_init(void) { printk(KERN_INFO "Dummy loaded\n"); return 0; }
-static void __exit dummy_exit(void) { printk(KERN_INFO "Dummy unloaded\n"); }
-module_init(dummy_init);
-module_exit(dummy_exit);
-MODULE_LICENSE("GPL");
-EOF
-
-          # Link KernelSU driver
+          # Link KernelSU Driver
           ln -sf $GITHUB_WORKSPACE/KernelSU/kernel common/drivers/kernelsu
           
-          # Enable KernelSU in gki_defconfig
+          # Enable KernelSU in defconfig
           echo "CONFIG_KSU=y" >> common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_DEBUG=y" >> common/arch/arm64/configs/gki_defconfig
+          
+          # Create dummy module
+          mkdir -p common/drivers/dummy_mod
+          cat << 'EOF' > common/drivers/dummy_mod/Makefile
+          obj-m += dummy.o
+          EOF
+          cat << 'EOF' > common/drivers/dummy_mod/dummy.c
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          static int __init dummy_init(void) { printk(KERN_INFO "Dummy loaded\n"); return 0; }
+          static void __exit dummy_exit(void) { printk(KERN_INFO "Dummy unloaded\n"); }
+          module_init(dummy_init);
+          module_exit(dummy_exit);
+          MODULE_LICENSE("GPL");
+          EOF
 
-      - name: Apply Surgical ABI-Safe Header Patches (Python Regex Fix)
+      - name: Apply ABI-Safe Header Patches (Python Regex - Grok Hardened)
         run: |
           cd $GITHUB_WORKSPACE/kernel_source/common
           
-          # Using Python to handle tabs and whitespace reliably
           python3 - << 'PY'
           import re
           import sys
@@ -120,15 +124,15 @@ EOF
                       
                   with open(filepath, 'w') as f:
                       f.write(new_content)
-                  print(f"✅ Successfully patched {description} in {filepath}")
+                  print(f"✅ Successfully patched {description} in {filepath} (Count: {count})")
               except Exception as e:
                   print(f"❌ ERROR: Exception patching {filepath}: {e}")
                   sys.exit(1)
 
-          # 1. Patch alternative-macros.h
+          # 1. Patch alternative-macros.h (Tightened regex for tab/whitespace)
           patch_file(
               "arch/arm64/include/asm/alternative-macros.h",
-              r'ALTERNATIVE_CB\("b\s*%l\[l_no\]",\s*%\[cpucap\],\s*alt_cb_patch_nops\)',
+              r'ALTERNATIVE_CB\(\s*"b\s*%l\[l_no\]"\s*,\s*%\[cpucap\]\s*,\s*alt_cb_patch_nops\s*\)',
               'ALTERNATIVE("b %l[l_no]", "nop", %[cpucap])',
               "alternative-macros.h ALTERNATIVE_CB"
           )
@@ -136,13 +140,12 @@ EOF
           # 2. Patch barrier.h
           patch_file(
               "arch/arm64/include/asm/barrier.h",
-              r'ALTERNATIVE_CB\("dsb sy",\s*ARM64_HAS_GIC_PRIO_RELAXED_SYNC,\s*alt_cb_patch_nops\)',
+              r'ALTERNATIVE_CB\(\s*"dsb sy"\s*,\s*ARM64_HAS_GIC_PRIO_RELAXED_SYNC\s*,\s*alt_cb_patch_nops\s*\)',
               'ALTERNATIVE("dsb sy", "nop", ARM64_HAS_GIC_PRIO_RELAXED_SYNC)',
               "barrier.h ALTERNATIVE_CB"
           )
 
           # 3. Patch jump_label.h
-          # Rename originals to avoid __jump_table generation
           patch_file(
               "include/linux/jump_label.h",
               r'static\s+__always_inline\s+bool\s+static_key_false\(struct static_key \*key\)',
@@ -172,7 +175,22 @@ EOF
           print("✅ Appended ABI-safe static_key definitions.")
           PY
 
-      - name: Build Full Kernel (Generate Module.symvers)
+      - name: Build Kernel with AOSP build.sh
+        run: |
+          cd $GITHUB_WORKSPACE/kernel_source
+          
+          export PATH=$GITHUB_WORKSPACE/toolchain/bin:$GITHUB_WORKSPACE/toolchain/build-tools/linux-x86/bin:$PATH
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+          export CCACHE_DIR=$GITHUB_WORKSPACE/.ccache
+          export CC="ccache clang"
+          
+          BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
+
+      - name: Build External Modules (With KBUILD_EXTRA_SYMBOLS)
         run: |
           cd $GITHUB_WORKSPACE/kernel_source/common
           
@@ -182,35 +200,17 @@ EOF
           export CC=clang
           export LLVM=1
           export LLVM_IAS=1
-          
           export CCACHE_DIR=$GITHUB_WORKSPACE/.ccache
           export CC="ccache clang"
           
-          echo "Configuring Kernel..."
-          make gki_defconfig
-          
-          # Force regeneration of autoconf.h
-          rm -f include/config/auto.conf include/generated/autoconf.h
-          make -j$(nproc) syncconfig
-          
-          echo "Building Kernel (this takes a while)..."
-          # We must build vmlinux to generate a valid Module.symvers
-          # This eliminates the "_printk undefined!" modpost warnings
-          make -j$(nproc) Image modules_prepare
-          
-      - name: Build External Modules
-        run: |
-          cd $GITHUB_WORKSPACE/kernel_source/common
-          
-          export PATH=$GITHUB_WORKSPACE/toolchain/bin:$GITHUB_WORKSPACE/toolchain/build-tools/linux-x86/bin:$PATH
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=clang
-          export LLVM=1
-          export LLVM_IAS=1
-          
-          export CCACHE_DIR=$GITHUB_WORKSPACE/.ccache
-          export CC="ccache clang"
+          # Grok's explicit Module.symvers fix
+          SYMVERS=$(find $GITHUB_WORKSPACE/kernel_source/out -name Module.symvers | head -n 1)
+          if [ -z "$SYMVERS" ]; then
+              echo "❌ ERROR: Module.symvers not found!"
+              exit 1
+          fi
+          echo "Using Module.symvers: $SYMVERS"
+          export KBUILD_EXTRA_SYMBOLS="$SYMVERS"
           
           KSU_DIR=$GITHUB_WORKSPACE/KernelSU/kernel
           
@@ -227,10 +227,8 @@ EOF
           KO_FILE=$(find $GITHUB_WORKSPACE/KernelSU -name "kernelsu.ko" | head -n 1)
           echo "Checking: $KO_FILE"
           
-          # Verify no alt_cb_patch_nops or __jump_table relocations
           if llvm-readelf -r -S "$KO_FILE" | grep -E "alt_cb_patch_nops|__jump_table"; then
             echo "❌ ERROR: External PREL32 relocations still present in the compiled .ko!"
-            echo "The header patches did not apply correctly or were bypassed."
             exit 1
           else
             echo "✅ Success: No alt_cb_patch_nops or __jump_table found in the final binary."
