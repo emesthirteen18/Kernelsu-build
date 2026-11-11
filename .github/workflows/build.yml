@@ -200,6 +200,10 @@ jobs:
         touch Module.symvers
 
         KSU_DIR=$(realpath drivers/kernelsu)
+        
+        # CRITICAL FIX: Clean the module directory to force recompilation with JUMP_LABEL=n
+        make -j$(nproc) M="$KSU_DIR" clean
+
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
           CONFIG_KSU=m \
           CONFIG_KSU_SAFE_LATE_LOAD=y \
