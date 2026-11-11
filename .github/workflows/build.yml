@@ -34,8 +34,9 @@ jobs:
       run: |
         mkdir -p $HOME/clang
         cd $HOME/clang
-        # Download the tarball directly to avoid git checkout timeouts
-        wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r510928.tar.gz -O clang.tar.gz
+        echo "Downloading Clang..."
+        # Using curl with 'main' branch to avoid 404 and git timeouts
+        curl -L -f -o clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz"
         mkdir -p clang-r510928
         tar -xzf clang.tar.gz -C clang-r510928
         rm clang.tar.gz
