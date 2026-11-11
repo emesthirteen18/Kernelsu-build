@@ -1,4 +1,3 @@
-#new
 name: Build KernelSU Module (NothingOSS ABI-Safe)
 
 on: [push, workflow_dispatch]
@@ -31,16 +30,15 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler aria2 lld clang llvm
 
-    - name: Sparse Clone Prebuilt Clang Toolchain (r510928)
+    - name: Download Prebuilt Clang Toolchain (r510928)
       run: |
         mkdir -p $HOME/clang
         cd $HOME/clang
-        git init
-        git remote add origin https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
-        git config core.sparseCheckout true
-        echo "clang-r510928/*" >> .git/info/sparse-checkout
-        git fetch --depth=1 origin main || git fetch --depth=1 origin master
-        git checkout FETCH_HEAD
+        # Download the tarball directly to avoid git checkout timeouts
+        wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r510928.tar.gz -O clang.tar.gz
+        mkdir -p clang-r510928
+        tar -xzf clang.tar.gz -C clang-r510928
+        rm clang.tar.gz
 
     - name: Integrate BakaSU
       working-directory: ./kernel_source
