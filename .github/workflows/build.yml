@@ -32,6 +32,7 @@ jobs:
     - name: Integrate BakaSU
       working-directory: ./kernel_source
       run: |
+        rm -rf KernelSU
         curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
     - name: Apply SAFE_LATE_LOAD Patch
@@ -200,8 +201,7 @@ jobs:
         touch Module.symvers
 
         KSU_DIR=$(realpath drivers/kernelsu)
-        
-        # CRITICAL FIX: Clean the module directory to force recompilation with JUMP_LABEL=n
+
         make -j$(nproc) M="$KSU_DIR" clean
 
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
@@ -217,18 +217,12 @@ jobs:
         llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
         llvm-strip -d "drivers/dummy_mod/dummy.ko" || true
 
-        echo "[CHECK] __jump_table in compiled .ko ..."
-        if llvm-readelf -SW "$KSU_DIR/kernelsu.ko" 2>/dev/null | grep -q "__jump_table"; then
-            SIZE=$(llvm-readelf -SW "$KSU_DIR/kernelsu.ko" | grep "__jump_table" | awk '{print $6}')
-            if [ "$SIZE" != "000000" ] && [ "$SIZE" != "0" ] && [ -n "$SIZE" ]; then
-                echo "ERROR: __jump_table present with size=$SIZE"
-                exit 1
-            fi
+        echo "[CHECK] PREL32 relocations (alt_cb_patch_nops) ..."
+        if llvm-readelf -rW "$KSU_DIR/kernelsu.ko" 2>/dev/null | grep -q "alt_cb_patch_nops"; then
+            echo "ERROR: alt_cb_patch_nops relocation still present!"
+            exit 1
         fi
-        echo "[+] __jump_table absent or zero-sized"
-
-        echo "[CHECK] large-model sequences ..."
-        llvm-objdump -d "$KSU_DIR/kernelsu.ko" | grep -m1 -E "movz|movk" >/dev/null && echo "[+] large-model sequences present" || echo "[!] warning: no MOVZ/MOVK seen"
+        echo "[+] No PREL32 alt_cb_patch_nops relocations."
 
         strings "$KSU_DIR/kernelsu.ko" | grep -q "SAFE_LATE_LOAD" || { echo "ERROR: SAFE_LATE_LOAD missing from .ko"; exit 1; }
 
