@@ -1,253 +1,324 @@
-#new
-name: Build KernelSU LKM (GKI 6.6 ABI-Safe)
+name: Build KernelSU Module (NothingOSS ABI-Safe)
 
-on:
-  workflow_dispatch:
-    inputs:
-      kernel_version:
-        description: 'Kernel version (e.g., android16-6.6)'
-        required: true
-        default: 'android16-6.6'
-        type: string
-      ksu_ref:
-        description: 'KernelSU/BakaSU branch or tag'
-        required: true
-        default: 'main'
-        type: string
-
-env:
-  KSU_REPO: BakaSU/KernelSU
-  CLANG_VERSION: r510928
-  BUILD_TOOLS_VERSION: linux-x86
+on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 16384
-          temp-reserve-mb: 4096
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 8192
+        temp-reserve-mb: 2048
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
 
-      - name: Checkout KernelSU (BakaSU)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.KSU_REPO }}
-          ref: ${{ inputs.ksu_ref }}
-          path: KernelSU
-          fetch-depth: 0
+    - name: Checkout Nothing Kernel Source
+      uses: actions/checkout@v4
+      with:
+        repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
+        ref: 'sm7750/b/FroggerPro'
+        path: 'kernel_source'
+        fetch-depth: 1
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y repo bc cpio flex bison libssl-dev libelf-dev ccache python3 zip wget git
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev libelf-dev python3 unzip curl wget device-tree-compiler aria2 lld clang llvm
 
-      - name: Set up ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          max-size: 5G
+    - name: Sparse Clone Prebuilt Clang Toolchain (r510928)
+      run: |
+        mkdir -p $HOME/clang
+        cd $HOME/clang
+        git init
+        git remote add origin https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+        git config core.sparseCheckout true
+        echo "clang-r510928/*" >> .git/info/sparse-checkout
+        git fetch --depth=1 origin main || git fetch --depth=1 origin master
+        git checkout FETCH_HEAD
 
-      - name: Download AOSP Clang Toolchain
-        run: |
-          mkdir -p $GITHUB_WORKSPACE/toolchain
-          cd $GITHUB_WORKSPACE/toolchain
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${CLANG_VERSION}.tar.gz -O clang.tar.gz
-          tar -xzf clang.tar.gz
-          rm clang.tar.gz
+    - name: Integrate BakaSU
+      working-directory: ./kernel_source
+      run: |
+        rm -rf KernelSU
+        curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
-      - name: Download AOSP Build-Tools
-        run: |
-          cd $GITHUB_WORKSPACE/toolchain
-          wget -q https://android.googlesource.com/platform/prebuilts/build-tools/+archive/refs/heads/main/${BUILD_TOOLS_VERSION}.tar.gz -O build-tools.tar.gz
-          mkdir -p build-tools
-          tar -xzf build-tools.tar.gz -C build-tools
-          rm build-tools.tar.gz
+    - name: Apply SAFE_LATE_LOAD Patch
+      working-directory: ./kernel_source
+      run: |
+        cat > /tmp/patch_ksu.py << 'PYEOF'
+        import sys
+        from pathlib import Path
 
-      - name: Sync AOSP Kernel Source
-        run: |
-          mkdir -p $GITHUB_WORKSPACE/kernel_source
-          cd $GITHUB_WORKSPACE/kernel_source
-          
-          repo init --depth=1 --u https://android.googlesource.com/kernel/manifest \
-            -b common-${{ inputs.kernel_version }} --repo-rev=v2.16
-          repo sync -c -j$(nproc --all) --no-tags --fail-fast
+        def apply_patch():
+            ksu_dir = Path("drivers/kernelsu").resolve()
+            kconfig_path = ksu_dir / "Kconfig"
+            initc_path = ksu_dir / "core" / "init.c"
 
-      - name: Integrate KernelSU and Dummy Module
-        run: |
-          cd $GITHUB_WORKSPACE/kernel_source
-          
-          # Link KernelSU Driver
-          ln -sf $GITHUB_WORKSPACE/KernelSU/kernel common/drivers/kernelsu
-          
-          # Enable KernelSU in defconfig
-          echo "CONFIG_KSU=y" >> common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_DEBUG=y" >> common/arch/arm64/configs/gki_defconfig
-          
-          # Create dummy module
-          mkdir -p common/drivers/dummy_mod
-          cat << 'EOF' > common/drivers/dummy_mod/Makefile
-          obj-m += dummy.o
-          EOF
-          cat << 'EOF' > common/drivers/dummy_mod/dummy.c
-          #include <linux/module.h>
-          #include <linux/kernel.h>
-          static int __init dummy_init(void) { printk(KERN_INFO "Dummy loaded\n"); return 0; }
-          static void __exit dummy_exit(void) { printk(KERN_INFO "Dummy unloaded\n"); }
-          module_init(dummy_init);
-          module_exit(dummy_exit);
-          MODULE_LICENSE("GPL");
-          EOF
+            if not kconfig_path.exists():
+                print(f"ERROR: Kconfig not found at {kconfig_path}!")
+                sys.exit(1)
+            if not initc_path.exists():
+                print(f"ERROR: init.c not found at {initc_path}!")
+                sys.exit(1)
 
-      - name: Apply ABI-Safe Header Patches (Python Regex - Grok Hardened)
-        run: |
-          cd $GITHUB_WORKSPACE/kernel_source/common
-          
-          python3 - << 'PY'
-          import re
-          import sys
+            kconfig_text = kconfig_path.read_text()
+            kconfig_anchor = 'menu "KernelSU"'
+            if kconfig_anchor not in kconfig_text:
+                print("ERROR: Could not find 'menu \"KernelSU\"' in Kconfig!")
+                sys.exit(1)
 
-          def patch_file(filepath, pattern, replacement, description):
-              try:
-                  with open(filepath, 'r') as f:
-                      content = f.read()
-                  
-                  new_content, count = re.subn(pattern, replacement, content)
-                  
-                  if count == 0:
-                      print(f"❌ ERROR: Failed to patch {description} in {filepath}")
-                      sys.exit(1)
-                      
-                  with open(filepath, 'w') as f:
-                      f.write(new_content)
-                  print(f"✅ Successfully patched {description} in {filepath} (Count: {count})")
-              except Exception as e:
-                  print(f"❌ ERROR: Exception patching {filepath}: {e}")
-                  sys.exit(1)
+            if "config KSU_SAFE_LATE_LOAD" not in kconfig_text:
+                safe_config = (
+                    'menu "KernelSU"\n\n'
+                    'config KSU_SAFE_LATE_LOAD\n'
+                    '\tbool "Safe late-load (skip aggressive init on OEM kernels)"\n'
+                    '\tdepends on KSU\n'
+                    '\tdefault y\n'
+                    '\thelp\n'
+                    '\t  When late-loading the LKM, skip cred mutation, SELinux domain\n'
+                    '\t  escape, and full syscall-hook registration.\n'
+                )
+                kconfig_text = kconfig_text.replace(kconfig_anchor, safe_config, 1)
+                kconfig_path.write_text(kconfig_text)
+                print("Successfully patched Kconfig.")
+            else:
+                print("Kconfig already patched.")
 
-          # 1. Patch alternative-macros.h (Tightened regex for tab/whitespace)
-          patch_file(
-              "arch/arm64/include/asm/alternative-macros.h",
-              r'ALTERNATIVE_CB\(\s*"b\s*%l\[l_no\]"\s*,\s*%\[cpucap\]\s*,\s*alt_cb_patch_nops\s*\)',
-              'ALTERNATIVE("b %l[l_no]", "nop", %[cpucap])',
-              "alternative-macros.h ALTERNATIVE_CB"
-          )
+            init_text = initc_path.read_text()
+            anchor1 = 'pr_info("late load mode, skipping kprobe hooks\\n");'
+            anchor2 = 'if (!getenforce()) {'
 
-          # 2. Patch barrier.h
-          patch_file(
-              "arch/arm64/include/asm/barrier.h",
-              r'ALTERNATIVE_CB\(\s*"dsb sy"\s*,\s*ARM64_HAS_GIC_PRIO_RELAXED_SYNC\s*,\s*alt_cb_patch_nops\s*\)',
-              'ALTERNATIVE("dsb sy", "nop", ARM64_HAS_GIC_PRIO_RELAXED_SYNC)',
-              "barrier.h ALTERNATIVE_CB"
-          )
+            if anchor1 not in init_text:
+                print("ERROR: Could not find anchor1 in init.c!")
+                sys.exit(1)
+            if anchor2 not in init_text:
+                print("ERROR: Could not find anchor2 in init.c!")
+                sys.exit(1)
 
-          # 3. Patch jump_label.h
-          patch_file(
-              "include/linux/jump_label.h",
-              r'static\s+__always_inline\s+bool\s+static_key_false\(struct static_key \*key\)',
-              'static __always_inline bool __unused_jl_false(struct static_key *key)',
-              "jump_label.h static_key_false rename"
-          )
-          patch_file(
-              "include/linux/jump_label.h",
-              r'static\s+__always_inline\s+bool\s+static_key_true\(struct static_key \*key\)',
-              'static __always_inline bool __unused_jl_true(struct static_key *key)',
-              "jump_label.h static_key_true rename"
-          )
-          
-          # Append ABI-safe definitions
-          with open("include/linux/jump_label.h", "a") as f:
-              f.write("""
-          /* ABI-safe redefinition: use count instead of jump table */
-          static __always_inline bool static_key_false(struct static_key *key)
-          {
-              return unlikely(static_key_count(key) > 0);
-          }
-          static __always_inline bool static_key_true(struct static_key *key)
-          {
-              return likely(static_key_count(key) > 0);
-          }
-          """)
-          print("✅ Appended ABI-safe static_key definitions.")
-          PY
+            if "SAFE_LATE_LOAD" not in init_text:
+                patch1 = (
+                    anchor1 + "\n"
+                    "#ifdef CONFIG_KSU_SAFE_LATE_LOAD\n"
+                    '\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");\n'
+                    "\t\tksu_boot_completed = true;\n"
+                    "\t\tgoto safe_late_done;\n"
+                    "#endif"
+                )
+                init_text = init_text.replace(anchor1, patch1, 1)
 
-      - name: Build Kernel with AOSP build.sh
-        run: |
-          cd $GITHUB_WORKSPACE/kernel_source
-          
-          export PATH=$GITHUB_WORKSPACE/toolchain/bin:$GITHUB_WORKSPACE/toolchain/build-tools/linux-x86/bin:$PATH
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=clang
-          export LLVM=1
-          export LLVM_IAS=1
-          export CCACHE_DIR=$GITHUB_WORKSPACE/.ccache
-          export CC="ccache clang"
-          
-          BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh
+                patch2 = (
+                    "#ifndef CONFIG_KSU_SAFE_LATE_LOAD\n"
+                    "\t\t" + anchor2
+                )
+                init_text = init_text.replace(anchor2, patch2, 1)
 
-      - name: Build External Modules (With KBUILD_EXTRA_SYMBOLS)
-        run: |
-          cd $GITHUB_WORKSPACE/kernel_source/common
-          
-          export PATH=$GITHUB_WORKSPACE/toolchain/bin:$GITHUB_WORKSPACE/toolchain/build-tools/linux-x86/bin:$PATH
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=clang
-          export LLVM=1
-          export LLVM_IAS=1
-          export CCACHE_DIR=$GITHUB_WORKSPACE/.ccache
-          export CC="ccache clang"
-          
-          # Grok's explicit Module.symvers fix
-          SYMVERS=$(find $GITHUB_WORKSPACE/kernel_source/out -name Module.symvers | head -n 1)
-          if [ -z "$SYMVERS" ]; then
-              echo "❌ ERROR: Module.symvers not found!"
-              exit 1
-          fi
-          echo "Using Module.symvers: $SYMVERS"
-          export KBUILD_EXTRA_SYMBOLS="$SYMVERS"
-          
-          KSU_DIR=$GITHUB_WORKSPACE/KernelSU/kernel
-          
-          echo "Building KernelSU Module..."
-          make -j$(nproc) M=$KSU_DIR \
-            CFLAGS_MODULE="-mcmodel=large" \
-            modules
-          
-          echo "Building Dummy Module..."
-          make -j$(nproc) M=drivers/dummy_mod modules
+                anchor3 = "setenforce(true);\n\t\t}"
+                if anchor3 not in init_text:
+                    anchor3 = "setenforce(true);\n        }"
+                if anchor3 not in init_text:
+                    print("ERROR: Could not find setenforce(true) block in init.c!")
+                    sys.exit(1)
 
-      - name: Verify No Problematic Relocations
-        run: |
-          KO_FILE=$(find $GITHUB_WORKSPACE/KernelSU -name "kernelsu.ko" | head -n 1)
-          echo "Checking: $KO_FILE"
-          
-          if llvm-readelf -r -S "$KO_FILE" | grep -E "alt_cb_patch_nops|__jump_table"; then
-            echo "❌ ERROR: External PREL32 relocations still present in the compiled .ko!"
+                init_text = init_text.replace(
+                    anchor3,
+                    anchor3 + "\n#endif\nsafe_late_done:\n\t\t;",
+                    1
+                )
+                initc_path.write_text(init_text)
+                print("Successfully patched init.c.")
+            else:
+                print("init.c already patched.")
+
+        apply_patch()
+        PYEOF
+        python3 /tmp/patch_ksu.py
+
+    - name: Apply ABI-Safe Header Patches (Grok Gemini Fix)
+      working-directory: ./kernel_source
+      run: |
+        python3 - << 'PY'
+        import re, sys
+        def patch_file(path, pat, repl, desc):
+            with open(path) as f: content = f.read()
+            new, n = re.subn(pat, repl, content)
+            if n == 0:
+                print(f"ERROR: failed to patch {desc} in {path}"); sys.exit(1)
+            open(path, "w").write(new)
+            print(f"patched {desc}")
+            
+        # 1. Fix alternative-macros.h (eliminates alt_cb_patch_nops)
+        patch_file(
+            "arch/arm64/include/asm/alternative-macros.h",
+            r'ALTERNATIVE_CB\(\s*"b\s*%l\[l_no\]"\s*,\s*%\[cpucap\]\s*,\s*alt_cb_patch_nops\s*\)',
+            'ALTERNATIVE("b %l[l_no]", "nop", %[cpucap])',
+            "ALTERNATIVE_CB"
+        )
+        
+        # 2. Fix barrier.h (eliminates alt_cb_patch_nops)
+        patch_file(
+            "arch/arm64/include/asm/barrier.h",
+            r'ALTERNATIVE_CB\(\s*"dsb sy"\s*,\s*ARM64_HAS_GIC_PRIO_RELAXED_SYNC\s*,\s*alt_cb_patch_nops\s*\)',
+            'ALTERNATIVE("dsb sy", "nop", ARM64_HAS_GIC_PRIO_RELAXED_SYNC)',
+            "barrier ALTERNATIVE_CB"
+        )
+        
+        # 3. Fix jump_label.h (eliminates __jump_table, preserves 16-byte struct)
+        patch_file(
+            "include/linux/jump_label.h",
+            r'static\s+__always_inline\s+bool\s+static_key_false\(struct static_key \*key\)',
+            'static __always_inline bool __unused_jl_false(struct static_key *key)',
+            "static_key_false rename"
+        )
+        patch_file(
+            "include/linux/jump_label.h",
+            r'static\s+__always_inline\s+bool\s+static_key_true\(struct static_key \*key\)',
+            'static __always_inline bool __unused_jl_true(struct static_key *key)',
+            "static_key_true rename"
+        )
+        
+        with open("include/linux/jump_label.h", "a") as f:
+            f.write("""
+        static __always_inline bool static_key_false(struct static_key *key)
+        { return unlikely(static_key_count(key) > 0); }
+        static __always_inline bool static_key_true(struct static_key *key)
+        { return likely(static_key_count(key) > 0); }
+        """)
+        print("appended ABI-safe static_key_*")
+        PY
+
+    - name: Create Dummy Module (For Kernel Stability Testing)
+      working-directory: ./kernel_source
+      run: |
+        mkdir -p drivers/dummy_mod
+        cat > drivers/dummy_mod/Makefile << 'EOF'
+        obj-m := dummy.o
+        EOF
+        cat > drivers/dummy_mod/dummy.c << 'EOF'
+        #include <linux/module.h>
+        #include <linux/kernel.h>
+        static int __init dummy_init(void) {
+            pr_info("DUMMY: Successfully inserted dummy module!\n");
+            return 0;
+        }
+        static void __exit dummy_exit(void) {
+            pr_info("DUMMY: Removed dummy module.\n");
+        }
+        module_init(dummy_init);
+        module_exit(dummy_exit);
+        MODULE_LICENSE("GPL");
+        EOF
+
+    - name: Compile the Modules
+      working-directory: ./kernel_source
+      run: |
+        export KBUILD_MODPOST_WARN=1
+        export PATH="$HOME/clang/clang-r510928/bin:$PATH"
+        export ARCH=arm64
+        export LLVM=1
+        export LLVM_IAS=1
+        export CC=clang
+        export LD=ld.lld
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJCOPY=llvm-objcopy
+        export OBJDUMP=llvm-objdump
+        export STRIP=llvm-strip
+        export READELF=llvm-readelf
+        export HOSTCC=clang
+        export HOSTLD=ld.lld
+
+        echo "-android15-8-g1a9b880d342b-ab15218529-4k" > .scmversion
+        sed -i '51,54d' include/trace/hooks/blk.h
+
+        awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
+          drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && \
+          mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
+
+        make gki_defconfig
+        scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
+
+        scripts/config --enable CONFIG_MODULES
+        scripts/config --enable CONFIG_MODULE_UNLOAD
+        scripts/config --disable CONFIG_MODULE_SIG
+        scripts/config --set-val CONFIG_KSU m
+        scripts/config --enable CONFIG_KSU_SAFE_LATE_LOAD
+        scripts/config --disable CONFIG_LOCALVERSION_AUTO
+        scripts/config --set-str CONFIG_LOCALVERSION ""
+        
+        # Note: We intentionally leave CONFIG_JUMP_LABEL=y (GKI ABI Safe)
+
+        make -j$(nproc) olddefconfig
+
+        # Force re-generation of autoconf.h from .config
+        rm -f include/generated/autoconf.h include/config/auto.conf
+        make -j$(nproc) prepare
+
+        echo "[CHECK] .config state ..."
+        if ! grep -q "^CONFIG_JUMP_LABEL=y" .config; then
+            echo "ERROR: CONFIG_JUMP_LABEL=y missing from .config"
             exit 1
-          else
-            echo "✅ Success: No alt_cb_patch_nops or __jump_table found in the final binary."
-          fi
+        fi
+        echo "[+] .config has CONFIG_JUMP_LABEL=y"
 
-      - name: Package Artifacts
-        run: |
-          mkdir -p $GITHUB_WORKSPACE/output
-          cp $(find $GITHUB_WORKSPACE/KernelSU -name "kernelsu.ko" | head -n 1) $GITHUB_WORKSPACE/output/
-          cp $(find $GITHUB_WORKSPACE/kernel_source/common/drivers/dummy_mod -name "dummy.ko" | head -n 1) $GITHUB_WORKSPACE/output/
-          
-          cd $GITHUB_WORKSPACE/output
-          zip -r modulesNEWEST.zip .
+        echo "[CHECK] autoconf.h state ..."
+        if ! grep -q "#define CONFIG_JUMP_LABEL 1" include/generated/autoconf.h; then
+            echo "ERROR: CONFIG_JUMP_LABEL missing from autoconf.h"
+            exit 1
+        fi
+        echo "[+] autoconf.h has CONFIG_JUMP_LABEL define"
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernelsu-modules-${{ inputs.kernel_version }}
-          path: |
-            ${{ github.workspace }}/output/modulesNEWEST.zip
-          if-no-files-found: error
+        make -j$(nproc) security/selinux/built-in.a
+        touch Module.symvers
+
+        KSU_DIR=$(realpath drivers/kernelsu)
+
+        # Force clean rebuild of the module directory
+        make -j$(nproc) M="$KSU_DIR" clean
+
+        make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
+          CONFIG_KSU=m \
+          CONFIG_KSU_SAFE_LATE_LOAD=y \
+          KCFLAGS="-DCONFIG_KSU_SAFE_LATE_LOAD=1" \
+          CFLAGS_MODULE="-mcmodel=large" \
+          KBUILD_MODPOST_WARN=1 \
+          modules
+
+        make -j$(nproc) M=drivers/dummy_mod modules
+
+        llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
+        llvm-strip -d "drivers/dummy_mod/dummy.ko" || true
+
+        echo "[CHECK] PREL32 relocations (alt_cb_patch_nops) ..."
+        if llvm-readelf -rW "$KSU_DIR/kernelsu.ko" 2>/dev/null | grep -q "alt_cb_patch_nops"; then
+            echo "ERROR: alt_cb_patch_nops relocation still present!"
+            echo "Dumping first 20 matches:"
+            llvm-readelf -rW "$KSU_DIR/kernelsu.ko" | grep "alt_cb_patch_nops" | head -20
+            exit 1
+        fi
+        echo "[+] No PREL32 alt_cb_patch_nops relocations."
+
+        echo "[CHECK] __jump_table section ..."
+        if llvm-readelf -SW "$KSU_DIR/kernelsu.ko" 2>/dev/null | grep -q "__jump_table"; then
+            echo "ERROR: __jump_table section still present!"
+            exit 1
+        fi
+        echo "[+] No __jump_table section."
+
+        strings "$KSU_DIR/kernelsu.ko" | grep -q "SAFE_LATE_LOAD" || { echo "ERROR: SAFE_LATE_LOAD missing from .ko"; exit 1; }
+
+        cp "$KSU_DIR/kernelsu.ko" ./kernelsu.ko
+        cp "drivers/dummy_mod/dummy.ko" ./dummy.ko
+        ls -lh ./kernelsu.ko ./dummy.ko
+
+    - name: Upload Compiled Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: modulesNEWEST
+        path: |
+          kernel_source/kernelsu.ko
+          kernel_source/dummy.ko
