@@ -157,7 +157,7 @@ jobs:
         PYEOF
         python3 /tmp/patch_ksu.py
 
-    - name: Apply ABI-Safe Header Patches (Gemini 4 Argon Fix)
+    - name: Apply ABI-Safe Header Patches (Header-Order Safe READ_ONCE Fix)
       working-directory: ./kernel_source
       run: |
         python3 - << 'PY'
@@ -190,32 +190,33 @@ jobs:
             "barrier ALTERNATIVE_CB"
         )
 
-        # 3. Fix jump_label.h in-place (eliminates __jump_table in functions AND macros without redefinition)
+        # 3. Fix jump_label.h in-place using READ_ONCE(key->enabled.counter)
+        # Requires only <linux/types.h> and <linux/compiler.h>, which are already included at top of jump_label.h.
         patch_file(
             "include/linux/jump_label.h",
             r'static __always_inline bool static_key_false\(struct static_key \*key\)\s*\{\s*return arch_static_branch\(key, false\);\s*\}',
-            'static __always_inline bool static_key_false(struct static_key *key) { return static_key_count(key) > 0; }',
+            'static __always_inline bool static_key_false(struct static_key *key) { return unlikely(READ_ONCE(key->enabled.counter) > 0); }',
             "static_key_false body"
         )
         patch_file(
             "include/linux/jump_label.h",
             r'static __always_inline bool static_key_true\(struct static_key \*key\)\s*\{\s*return !arch_static_branch\(key, true\);\s*\}',
-            'static __always_inline bool static_key_true(struct static_key *key) { return static_key_count(key) > 0; }',
+            'static __always_inline bool static_key_true(struct static_key *key) { return likely(READ_ONCE(key->enabled.counter) > 0); }',
             "static_key_true body"
         )
         patch_file(
             "include/linux/jump_label.h",
             r'!\s*arch_static_branch(?:_jump)?\(&\(x\)->key,\s*true\)',
-            '(static_key_count(&(x)->key) > 0)',
+            '(READ_ONCE((x)->key.enabled.counter) > 0)',
             "static_branch_likely arch_static_branch calls"
         )
         patch_file(
             "include/linux/jump_label.h",
             r'arch_static_branch(?:_jump)?\(&\(x\)->key,\s*false\)',
-            '(static_key_count(&(x)->key) > 0)',
+            '(READ_ONCE((x)->key.enabled.counter) > 0)',
             "static_branch_unlikely arch_static_branch calls"
         )
-        print("injected in-place ABI-safe static_key_* and static_branch_* overrides inside jump_label.h")
+        print("injected in-place ABI-safe READ_ONCE static_key_* and static_branch_* overrides inside jump_label.h")
         PY
 
     - name: Create Dummy Module (For Kernel Stability Testing)
@@ -279,14 +280,8 @@ jobs:
         scripts/config --disable CONFIG_LOCALVERSION_AUTO
         scripts/config --set-str CONFIG_LOCALVERSION ""
 
-        # Note: We intentionally leave CONFIG_JUMP_LABEL=y (GKI ABI Safe)
-
         make -j$(nproc) olddefconfig
-
-        # Force re-generation of autoconf.h, modpost, and module.lds from .config
         rm -f include/generated/autoconf.h include/config/auto.conf
-
-        # Fix -Werror,-Warray-bounds compiler error
         make -j$(nproc) modules_prepare KCFLAGS="$KCFLAGS"
 
         echo "[CHECK] .config state ..."
@@ -307,8 +302,6 @@ jobs:
         touch Module.symvers
 
         KSU_DIR=$(realpath drivers/kernelsu)
-
-        # Force clean rebuild of the module directory
         make -j$(nproc) M="$KSU_DIR" clean
 
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
