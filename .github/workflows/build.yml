@@ -36,7 +36,6 @@ jobs:
         cd "$HOME/clang"
         rm -rf clang-repo clang-r510928
         echo "Cloning AOSP Clang prebuilt (llvm-r510928 branch)..."
-        # Prefer filtered sparse clone; clean up partial dir and fall back to plain depth-1 if Gitiles rejects the filter
         timeout 600 git clone --depth=1 --filter=blob:none --sparse \
           -b llvm-r510928 \
           https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
@@ -48,7 +47,6 @@ jobs:
             clang-repo
         }
         cd clang-repo
-        # Only needed if the first (sparse) clone succeeded; harmless on the fallback
         git sparse-checkout set clang-r510928 2>/dev/null || true
         cd ..
         test -d clang-repo/clang-r510928 || { echo "ERROR: clang-r510928 missing after clone"; exit 1; }
@@ -165,10 +163,10 @@ jobs:
         python3 - << 'PY'
         import re, sys
 
-        def patch_file(path, pat, repl, desc, count=0):
+        def patch_file(path, pat, repl, desc):
             with open(path, "r") as f:
                 content = f.read()
-            new, n = re.subn(pat, repl, content, count=count)
+            new, n = re.subn(pat, repl, content)
             if n == 0:
                 print(f"ERROR: failed to patch {desc} in {path}")
                 sys.exit(1)
@@ -176,7 +174,7 @@ jobs:
                 f.write(new)
             print(f"patched {desc} ({n} occurrence(s))")
 
-        # 1. Fix alternative-macros.h (eliminates alt_cb_patch_nops; handles optional macro backslashes)
+        # 1. Fix alternative-macros.h (eliminates alt_cb_patch_nops)
         patch_file(
             "arch/arm64/include/asm/alternative-macros.h",
             r'ALTERNATIVE_CB\([\s\\]*"b\s*%l\[l_no\]"[\s\\]*,[\s\\]*%\[cpucap\][\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)',
@@ -184,7 +182,7 @@ jobs:
             "ALTERNATIVE_CB"
         )
 
-        # 2. Fix barrier.h (eliminates alt_cb_patch_nops across backslash-continued macro lines)
+        # 2. Fix barrier.h (eliminates alt_cb_patch_nops)
         patch_file(
             "arch/arm64/include/asm/barrier.h",
             r'ALTERNATIVE_CB\([\s\\]*"dsb sy"[\s\\]*,[\s\\]*ARM64_HAS_GIC_PRIO_RELAXED_SYNC[\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)',
@@ -192,48 +190,32 @@ jobs:
             "barrier ALTERNATIVE_CB"
         )
 
-        # 3. Fix jump_label.h (eliminates __jump_table in both functions and macros, preserves 16-byte struct static_key)
+        # 3. Fix jump_label.h in-place (eliminates __jump_table in functions AND macros without redefinition)
         patch_file(
             "include/linux/jump_label.h",
-            r'static\s+__always_inline\s+bool\s+static_key_false\(struct static_key \*key\)',
-            'static __always_inline bool __unused_jl_false(struct static_key *key)',
-            "static_key_false rename",
-            count=1
+            r'static __always_inline bool static_key_false\(struct static_key \*key\)\s*\{\s*return arch_static_branch\(key, false\);\s*\}',
+            'static __always_inline bool static_key_false(struct static_key *key) { return static_key_count(key) > 0; }',
+            "static_key_false body"
         )
         patch_file(
             "include/linux/jump_label.h",
-            r'static\s+__always_inline\s+bool\s+static_key_true\(struct static_key \*key\)',
-            'static __always_inline bool __unused_jl_true(struct static_key *key)',
-            "static_key_true rename",
-            count=1
+            r'static __always_inline bool static_key_true\(struct static_key \*key\)\s*\{\s*return !arch_static_branch\(key, true\);\s*\}',
+            'static __always_inline bool static_key_true(struct static_key *key) { return static_key_count(key) > 0; }',
+            "static_key_true body"
         )
-
-        jl_path = "include/linux/jump_label.h"
-        with open(jl_path, "r") as f:
-            jl_content = f.read()
-
-        last_endif = jl_content.rfind("#endif")
-        if last_endif == -1:
-            print("ERROR: Could not find closing #endif in include/linux/jump_label.h")
-            sys.exit(1)
-
-        abi_safe_jl_override = """
-        #ifdef CONFIG_JUMP_LABEL
-        static __always_inline bool static_key_false(struct static_key *key)
-        { return unlikely(static_key_count(key) > 0); }
-        static __always_inline bool static_key_true(struct static_key *key)
-        { return likely(static_key_count(key) > 0); }
-        #undef static_branch_likely
-        #undef static_branch_unlikely
-        #define static_branch_likely(x)   likely(static_key_count(&(x)->key) > 0)
-        #define static_branch_unlikely(x) unlikely(static_key_count(&(x)->key) > 0)
-        #endif
-        """
-
-        jl_content = jl_content[:last_endif] + abi_safe_jl_override + "\n" + jl_content[last_endif:]
-        with open(jl_path, "w") as f:
-            f.write(jl_content)
-        print("injected ABI-safe static_key_* and static_branch_* overrides inside jump_label.h header guard")
+        patch_file(
+            "include/linux/jump_label.h",
+            r'!\s*arch_static_branch(?:_jump)?\(&\(x\)->key,\s*true\)',
+            '(static_key_count(&(x)->key) > 0)',
+            "static_branch_likely arch_static_branch calls"
+        )
+        patch_file(
+            "include/linux/jump_label.h",
+            r'arch_static_branch(?:_jump)?\(&\(x\)->key,\s*false\)',
+            '(static_key_count(&(x)->key) > 0)',
+            "static_branch_unlikely arch_static_branch calls"
+        )
+        print("injected in-place ABI-safe static_key_* and static_branch_* overrides inside jump_label.h")
         PY
 
     - name: Create Dummy Module (For Kernel Stability Testing)
@@ -262,6 +244,7 @@ jobs:
       working-directory: ./kernel_source
       run: |
         export KBUILD_MODPOST_WARN=1
+        export KCFLAGS="-Wno-array-bounds -Wno-error=array-bounds"
         export PATH="$HOME/clang/clang-r510928/bin:$PATH"
         export ARCH=arm64
         export LLVM=1
@@ -290,6 +273,7 @@ jobs:
         scripts/config --enable CONFIG_MODULES
         scripts/config --enable CONFIG_MODULE_UNLOAD
         scripts/config --disable CONFIG_MODULE_SIG
+        scripts/config --disable CONFIG_WERROR
         scripts/config --set-val CONFIG_KSU m
         scripts/config --enable CONFIG_KSU_SAFE_LATE_LOAD
         scripts/config --disable CONFIG_LOCALVERSION_AUTO
@@ -301,7 +285,9 @@ jobs:
 
         # Force re-generation of autoconf.h, modpost, and module.lds from .config
         rm -f include/generated/autoconf.h include/config/auto.conf
-        make -j$(nproc) modules_prepare
+
+        # Fix -Werror,-Warray-bounds compiler error
+        make -j$(nproc) modules_prepare KCFLAGS="$KCFLAGS"
 
         echo "[CHECK] .config state ..."
         if ! grep -q "^CONFIG_JUMP_LABEL=y" .config; then
@@ -317,7 +303,7 @@ jobs:
         fi
         echo "[+] autoconf.h has CONFIG_JUMP_LABEL define"
 
-        make -j$(nproc) security/selinux/built-in.a
+        make -j$(nproc) security/selinux/built-in.a KCFLAGS="$KCFLAGS"
         touch Module.symvers
 
         KSU_DIR=$(realpath drivers/kernelsu)
@@ -328,12 +314,12 @@ jobs:
         make -j$(nproc) M="$KSU_DIR" src="$KSU_DIR" \
           CONFIG_KSU=m \
           CONFIG_KSU_SAFE_LATE_LOAD=y \
-          KCFLAGS="-DCONFIG_KSU_SAFE_LATE_LOAD=1" \
-          CFLAGS_MODULE="-mcmodel=large" \
+          KCFLAGS="-Wno-array-bounds -Wno-error=array-bounds -DCONFIG_KSU_SAFE_LATE_LOAD=1" \
+          CFLAGS_MODULE="-mcmodel=large -Wno-array-bounds -Wno-error=array-bounds" \
           KBUILD_MODPOST_WARN=1 \
           modules
 
-        make -j$(nproc) M=drivers/dummy_mod modules
+        make -j$(nproc) M=drivers/dummy_mod KCFLAGS="$KCFLAGS" modules
 
         llvm-strip -d "$KSU_DIR/kernelsu.ko" || true
         llvm-strip -d "drivers/dummy_mod/dummy.ko" || true
@@ -341,8 +327,6 @@ jobs:
         echo "[CHECK] PREL32 relocations (alt_cb_patch_nops) ..."
         if llvm-readelf -rW "$KSU_DIR/kernelsu.ko" 2>/dev/null | grep -q "alt_cb_patch_nops"; then
             echo "ERROR: alt_cb_patch_nops relocation still present!"
-            echo "Dumping first 20 matches:"
-            llvm-readelf -rW "$KSU_DIR/kernelsu.ko" | grep "alt_cb_patch_nops" | head -20
             exit 1
         fi
         echo "[+] No PREL32 alt_cb_patch_nops relocations."
