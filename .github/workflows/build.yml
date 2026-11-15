@@ -217,6 +217,18 @@ jobs:
           print("injected in-place ABI-safe READ_ONCE static_key_* and static_branch_* overrides inside jump_label.h")
           PY
 
+      - name: Fix resolve_btfids / libbpf Clang const-qualifier error
+        working-directory: ./kernel_source
+        run: |
+          set -euo pipefail
+          LIBBPF="tools/lib/bpf/libbpf.c"
+          if [ -f "$LIBBPF" ] && grep -q 'char \*next_path;' "$LIBBPF"; then
+            sed -i 's/char \*next_path;/const char *next_path;/' "$LIBBPF"
+            echo "[+] Patched $LIBBPF (next_path -> const char *)"
+          else
+            echo "[!] libbpf.c pattern not found or already patched."
+          fi
+
       - name: Create Dummy Module (For Kernel Stability Testing)
         working-directory: ./kernel_source
         run: |
@@ -259,6 +271,9 @@ jobs:
           export HOSTCC=clang
           export HOSTLD=ld.lld
           export KBUILD_MODPOST_WARN=1
+          
+          # Safety net for the libbpf const-qualifier issue
+          export HOSTCFLAGS="-Wno-error=incompatible-pointer-types-discards-qualifiers"
           
           COMMON_WARN_FLAGS="-Wno-array-bounds -Wno-error=array-bounds -Wno-unreachable-code -Wno-unused-label -Wno-unused-function"
           export KCFLAGS="$COMMON_WARN_FLAGS"
