@@ -1,47 +1,368 @@
-name: Build KernelSU Module
+name: Build KernelSU Module (NothingOSS ABI-Safe All-in-One)
+
 on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
-    - name: Checkout Nothing Kernel Source
-      uses: actions/checkout@v4
-      with:
-        repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
-        ref: 'main'
-        path: 'kernel_source'
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 12288
+          temp-reserve-mb: 4096
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
 
-    - name: Install Build Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y git build-essential bc bison flex libssl-dev python3 unzip curl wget
+      - name: Checkout user repo (e-r20, spray, stock.ko)
+        uses: actions/checkout@v4
 
-    - name: Clone Prebuilt Clang Toolchain (r510928)
-      run: |
-        git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 ~/clang
-        
-    - name: Integrate BakaSU
-      working-directory: ./kernel_source
-      run: |
-        curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
+      - name: Checkout Nothing Kernel Source
+        uses: actions/checkout@v4
+        with:
+          repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
+          ref: 'sm7750/b/FroggerPro'
+          path: 'kernel_source'
+          fetch-depth: 1
 
-    - name: Compile the Module
-      working-directory: ./kernel_source
-      run: |
-        export PATH=~/clang/clang-r510928/bin:$PATH
-        export ARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        
-        make vendor/sm7750-perf_defconfig
-        scripts/config --enable CONFIG_MODULES
-        scripts/config --enable CONFIG_KSU
-        scripts/config --set-val CONFIG_KSU m
-        
-        make -j$(nproc) modules
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git build-essential bc bison flex libssl-dev libelf-dev \
+            python3 unzip curl wget device-tree-compiler aria2 pahole cpio zip
 
-    - name: Upload Compiling Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernelsu-module
-        path: kernel_source/drivers/kernelsu/kernelsu.ko
+      - name: Download Prebuilt Clang Toolchain (r510928)
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/clang"
+          cd "$HOME/clang"
+          URL="https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip"
+          curl -L -f --max-time 600 --retry 3 --retry-delay 5 -o clang.zip "$URL"
+          mkdir -p clang-r510928
+          unzip -q clang.zip -d clang-r510928 || true
+          if [ -d clang-r510928/clang-r510928 ]; then
+            mv clang-r510928/clang-r510928/* clang-r510928/ || true
+            rmdir clang-r510928/clang-r510928 || true
+          fi
+          rm -rf clang-r510928/runtimes_ndk_cxx || true
+          rm -f clang.zip
+          test -x "$HOME/clang/clang-r510928/bin/clang" || exit 1
+          
+          echo "$HOME/clang/clang-r510928/bin" >> "$GITHUB_PATH"
+          "$HOME/clang/clang-r510928/bin/clang" --version
+
+      - name: Integrate BakaSU
+        working-directory: ./kernel_source
+        run: |
+          rm -rf KernelSU drivers/kernelsu
+          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
+
+      - name: Apply SAFE_LATE_LOAD Patch and Marker
+        working-directory: ./kernel_source
+        run: |
+          set -euo pipefail
+          INIT_C=$(find . -name init.c -path '*/KernelSU/kernel/core/*' | head -n1)
+          [ -n "$INIT_C" ] || { echo "ERROR: init.c not found"; exit 1; }
+          echo "[+] Target init.c: $INIT_C"
+
+          python3 - "$INIT_C" <<'PYEOF'
+          import re, sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          text = p.read_text()
+
+          marker = '''
+          /* SAFE_LATE_LOAD forced marker */
+          static const char __used __attribute__((section(".rodata"))) safe_late_load_marker[] =
+              "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";
+          '''
+          if 'SAFE_LATE_LOAD: skipping rules/cred/escape/hook init' not in text:
+              text = marker + "\n" + text
+          if '(void)safe_late_load_marker;' not in text:
+              pattern = r'(int\s+__init\s+(?:kernelsu_init|ksu_init)\s*\([^)]*\)\s*\{)'
+              text, n_ref = re.subn(pattern, r'\1\n  (void)safe_late_load_marker;', text, count=1)
+
+          anchor1_pat = re.compile(r'(pr_info\(\s*"late load mode, skipping kprobe hooks\\n"\s*\)\s*;)')
+          selinux_block_pat = re.compile(r'(if\s*\(\s*!getenforce\(\)\s*\)\s*\{[\s\S]*?setenforce\(\s*true\s*\)\s*;\s*\})')
+          text, n1 = anchor1_pat.subn(
+              r'\1\n\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");\n\t\tksu_boot_completed = true;\n\t\tgoto safe_late_done;',
+              text, count=1)
+          text, n2 = selinux_block_pat.subn(
+              r'#if 0 /* Disabled by SAFE_LATE_LOAD */\n\1\n#endif\nsafe_late_done:\n\t\t;',
+              text, count=1)
+          p.write_text(text)
+          PYEOF
+
+      - name: Apply ABI-Safe Header Patches
+        working-directory: ./kernel_source
+        run: |
+          python3 - << 'PY'
+          import re, sys
+          def patch_file(path, pat, repl, desc):
+              with open(path, "r") as f: content = f.read()
+              new, n = re.subn(pat, repl, content)
+              if n == 0: print(f"ERROR: failed {desc}"); sys.exit(1)
+              with open(path, "w") as f: f.write(new)
+          patch_file("arch/arm64/include/asm/alternative-macros.h", r'ALTERNATIVE_CB\([\s\\]*"b\s*%l\[l_no\]"[\s\\]*,[\s\\]*%\[cpucap\][\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)', 'ALTERNATIVE("b %l[l_no]", "nop", %[cpucap])', "alt")
+          patch_file("arch/arm64/include/asm/barrier.h", r'ALTERNATIVE_CB\([\s\\]*"dsb sy"[\s\\]*,[\s\\]*ARM64_HAS_GIC_PRIO_RELAXED_SYNC[\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)', 'ALTERNATIVE("dsb sy", "nop", ARM64_HAS_GIC_PRIO_RELAXED_SYNC)', "barrier")
+          patch_file("include/linux/jump_label.h", r'static __always_inline bool static_key_false\(struct static_key \*key\)\s*\{\s*return arch_static_branch\(key, false\);\s*\}', 'static __always_inline bool static_key_false(struct static_key *key) { return unlikely(READ_ONCE(key->enabled.counter) > 0); }', "false")
+          patch_file("include/linux/jump_label.h", r'static __always_inline bool static_key_true\(struct static_key \*key\)\s*\{\s*return !arch_static_branch\(key, true\);\s*\}', 'static __always_inline bool static_key_true(struct static_key *key) { return likely(READ_ONCE(key->enabled.counter) > 0); }', "true")
+          patch_file("include/linux/jump_label.h", r'!\s*arch_static_branch(?:_jump)?\(&\(x\)->key,\s*true\)', '(READ_ONCE((x)->key.enabled.counter) > 0)', "likely")
+          patch_file("include/linux/jump_label.h", r'arch_static_branch(?:_jump)?\(&\(x\)->key,\s*false\)', '(READ_ONCE((x)->key.enabled.counter) > 0)', "unlikely")
+          PY
+
+      - name: Patch libbpf
+        working-directory: ./kernel_source
+        run: |
+          LIBBPF="tools/lib/bpf/libbpf.c"
+          if [ -f "$LIBBPF" ] && grep -q 'char \*next_path;' "$LIBBPF"; then
+            sed -i 's/char \*next_path;/const char *next_path;/' "$LIBBPF"
+          fi
+          echo "HOSTCFLAGS=-Wno-error=incompatible-pointer-types-discards-qualifiers" >> "$GITHUB_ENV"
+
+      - name: Compile Module
+        working-directory: ./kernel_source
+        run: |
+          set -euo pipefail
+          export ARCH=arm64 LLVM=1 LLVM_IAS=1 CC=clang LD=ld.lld
+          export AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip READELF=llvm-readelf HOSTCC=clang HOSTLD=ld.lld
+          export HOSTCFLAGS="-Wno-error=incompatible-pointer-types-discards-qualifiers"
+          export KBUILD_MODPOST_WARN=1
+          COMMON_WARN_FLAGS="-Wno-array-bounds -Wno-error=array-bounds -Wno-unreachable-code -Wno-unused-label -Wno-unused-function"
+          export KCFLAGS="$COMMON_WARN_FLAGS"
+
+          echo "-android15-8-g1a9b880d342b-ab15218529-4k" > .scmversion
+          sed -i '51,54d' include/trace/hooks/blk.h
+          awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
+            drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && \
+            mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
+
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
+          scripts/config --enable CONFIG_MODULES
+          scripts/config --enable CONFIG_MODULE_UNLOAD
+          scripts/config --disable CONFIG_MODULE_SIG
+          scripts/config --disable CONFIG_MODULE_SIG_FORCE
+          scripts/config --disable CONFIG_WERROR
+          scripts/config --module CONFIG_KSU
+          scripts/config --disable CONFIG_LOCALVERSION_AUTO
+          scripts/config --set-str CONFIG_LOCALVERSION ""
+
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 modules_prepare KCFLAGS="$KCFLAGS"
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 security/selinux/built-in.a KCFLAGS="$KCFLAGS"
+          touch Module.symvers
+
+          KSU_DIR=$(realpath drivers/kernelsu)
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 M="$KSU_DIR" clean
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            M="$KSU_DIR" src="$KSU_DIR" CONFIG_KSU=m \
+            KCFLAGS="$KCFLAGS -DCONFIG_KSU_SAFE_LATE_LOAD=1" \
+            CFLAGS_MODULE="-mcmodel=large $COMMON_WARN_FLAGS -DCONFIG_KSU_SAFE_LATE_LOAD=1" \
+            KBUILD_MODPOST_WARN=1 modules
+
+      - name: Verify Module
+        working-directory: ./kernel_source
+        run: |
+          set -euo pipefail
+          KSU_DIR=$(realpath drivers/kernelsu)
+          KO=$(find "$KSU_DIR" -maxdepth 2 -name "kernelsu*.ko" | head -n1)
+          [ -f "$KO" ] || { echo "FAIL: .ko not found"; exit 1; }
+          
+          # Check 1
+          if llvm-readelf -rW "$KO" | grep -q "alt_cb_patch_nops"; then
+            echo "FAIL: alt_cb_patch_nops found"
+            exit 1
+          fi
+          echo "PASS: No alt_cb_patch_nops"
+          
+          # Check 2
+          if llvm-readelf -SW "$KO" | grep -q "__jump_table"; then
+            echo "FAIL: __jump_table present"
+            exit 1
+          fi
+          echo "PASS: No __jump_table"
+          
+          # Check 3 (SIGPIPE FIX: Capture output first)
+          STRINGS_OUT=$(llvm-strings "$KO")
+          if ! echo "$STRINGS_OUT" | grep -F "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init" > /dev/null; then
+            echo "FAIL: SAFE_LATE_LOAD string missing from .ko"
+            exit 1
+          fi
+          echo "PASS: SAFE_LATE_LOAD string present"
+          
+          cp "$KO" /tmp/kernelsu_base.ko
+          echo "[+] Module verified. Copied to /tmp/kernelsu_base.ko"
+
+      - name: Stage All-in-One Artifact
+        run: |
+          set -euo pipefail
+          STAGE=/tmp/stage
+          mkdir -p "$STAGE"
+          cp /tmp/kernelsu_base.ko "$STAGE/kernelsu.ko"
+          
+          # Copy binaries from repo root
+          cp e-r20 spray stock.ko "$STAGE/"
+          chmod +x "$STAGE/e-r20" "$STAGE/spray" || true
+
+          # patch_final.py (Embedded)
+          cat > "$STAGE/patch_final.py" << 'PYEOF'
+          import struct, sys
+          ko_path = '/data/local/tmp/kernelsu_base.ko'
+          stock_ko = '/data/local/tmp/stock.ko'
+          kallsyms_path = '/data/local/tmp/kallsyms.txt'
+          SHT_SYMTAB = 2
+          SHN_ABS = 0xfff1
+          SHN_UNDEF = 0
+          GLOBAL_TYPES = {'T','D','R','B','V','W'}
+          kallsyms = {}; kallsyms_is_global = {}
+          with open(kallsyms_path) as f:
+              for line in f:
+                  parts = line.strip().split()
+                  if len(parts) >= 3:
+                      addr = int(parts[0], 16); sym_type = parts[1]; raw_name = parts[2]
+                      base_name = raw_name.split('.llvm.')[0]; is_glob = sym_type in GLOBAL_TYPES
+                      for c in (raw_name, base_name):
+                          if c not in kallsyms or (is_glob and not kallsyms_is_global.get(c, False)):
+                              kallsyms[c] = addr; kallsyms_is_global[c] = is_glob
+          with open(stock_ko, 'rb') as f: s_data = f.read()
+          s_shoff = struct.unpack('<Q', s_data[0x28:0x30])[0]
+          s_shentsize = struct.unpack('<H', s_data[0x3A:0x3C])[0]
+          s_shnum = struct.unpack('<H', s_data[0x3C:0x3E])[0]
+          s_shstrndx = struct.unpack('<H', s_data[0x3E:0x40])[0]
+          s_off = struct.unpack('<Q', s_data[s_shoff + s_shstrndx*s_shentsize + 0x18 : s_shoff + s_shstrndx*s_shentsize + 0x20])[0]
+          s_str = s_data[s_off:]
+          stock_versions = None
+          for i in range(s_shnum):
+              off = s_shoff + i*s_shentsize
+              nidx = struct.unpack('<I', s_data[off:off+4])[0]
+              if s_str[nidx:s_str.find(b'\x00', nidx)] == b'__versions':
+                  sec_off = struct.unpack('<Q', s_data[off+0x18:off+0x20])[0]
+                  sec_size = struct.unpack('<Q', s_data[off+0x20:off+0x28])[0]
+                  stock_versions = s_data[sec_off:sec_off+sec_size]; break
+          minimal_entry = None
+          if stock_versions:
+              for i in range(0, len(stock_versions), 64):
+                  if stock_versions[i+8:i+64].split(b'\x00',1)[0] == b'module_layout':
+                      minimal_entry = stock_versions[i:i+64]; break
+          with open(ko_path, 'rb') as f: data = bytearray(f.read())
+          if data[0:4] != b'\x7fELF': sys.exit('not ELF')
+          shoff = struct.unpack('<Q', data[0x28:0x30])[0]
+          shentsize = struct.unpack('<H', data[0x3A:0x3C])[0]
+          shnum = struct.unpack('<H', data[0x3C:0x3E])[0]
+          shstrndx = struct.unpack('<H', data[0x3E:0x40])[0]
+          strtab_off = struct.unpack('<Q', data[shoff + shstrndx*shentsize + 0x18 : shoff + shstrndx*shentsize + 0x20])[0]
+          strtab = bytes(data[strtab_off:])
+          def get_name(idx):
+              e = strtab.find(b'\x00', idx); return strtab[idx:e].decode(errors='ignore')
+          modinfo_idx, versions_idx = -1, -1
+          symtab_offset, symtab_size, symtab_entsize, strtab2 = 0,0,0,0
+          ZERO = {'.altinstructions','.rela.altinstructions','__jump_table','.rela__jump_table','__patchable_function_entries','.rela__patchable_function_entries'}
+          for i in range(shnum):
+              off = shoff + i*shentsize
+              name = get_name(struct.unpack('<I', data[off:off+4])[0])
+              sh_type = struct.unpack('<I', data[off+4:off+8])[0]
+              if name in ZERO: data[off+0x20:off+0x28] = struct.pack('<Q', 0)
+              if name == '.modinfo':
+                  modinfo_idx = i; modinfo_off = struct.unpack('<Q', data[off+0x18:off+0x20])[0]
+                  modinfo_size = struct.unpack('<Q', data[off+0x20:off+0x28])[0]
+              elif name == '__versions':
+                  versions_idx = i; versions_sh_offset = off
+              elif sh_type == SHT_SYMTAB:
+                  symtab_offset = struct.unpack('<Q', data[off+0x18:off+0x20])[0]
+                  symtab_size = struct.unpack('<Q', data[off+0x20:off+0x28])[0]
+                  symtab_entsize = struct.unpack('<Q', data[off+0x38:off+0x40])[0]
+                  sidx = struct.unpack('<I', data[off+0x28:off+0x2c])[0]
+                  strtab2 = struct.unpack('<Q', data[shoff + sidx*shentsize + 0x18 : shoff + sidx*shentsize + 0x20])[0]
+          for i in range(symtab_size // symtab_entsize):
+              sr = symtab_offset + i*symtab_entsize
+              st_name = struct.unpack('<I', data[sr:sr+4])[0]
+              st_shndx = struct.unpack('<H', data[sr+6:sr+8])[0]
+              end = data.find(b'\x00', strtab2 + st_name)
+              name = data[strtab2+st_name:end].decode(errors='ignore')
+              if name == '____versions' and versions_idx != -1:
+                  data[sr+6:sr+8] = struct.pack('<H', versions_idx)
+                  data[sr+8:sr+16] = struct.pack('<Q', 0)
+                  data[sr+16:sr+24] = struct.pack('<Q', 64)
+                  continue
+              if st_shndx == SHN_UNDEF and not name.startswith('__kcfi_typeid_') and name in kallsyms:
+                  data[sr+6:sr+8] = struct.pack('<H', SHN_ABS)
+                  data[sr+8:sr+16] = struct.pack('<Q', kallsyms[name])
+          modinfo_data = data[modinfo_off:modinfo_off+modinfo_size]
+          v_idx = modinfo_data.find(b'vermagic=')
+          vs = v_idx + 9; ve = modinfo_data.find(b'\x00', vs)
+          new_magic = b'6.6.127-android15-8-g1a9b880d342b-ab15218529-4k SMP preempt mod_unload modversions aarch64'
+          new_modinfo = modinfo_data[:vs] + new_magic + modinfo_data[ve:]
+          new_modinfo_off = len(data); data.extend(new_modinfo)
+          data[shoff+modinfo_idx*shentsize+0x18 : shoff+modinfo_idx*shentsize+0x20] = struct.pack('<Q', new_modinfo_off)
+          data[shoff+modinfo_idx*shentsize+0x20 : shoff+modinfo_idx*shentsize+0x28] = struct.pack('<Q', len(new_modinfo))
+          if versions_idx != -1:
+              new_versions_off = len(data); data.extend(minimal_entry)
+              data[versions_sh_offset+0x18:versions_sh_offset+0x20] = struct.pack('<Q', new_versions_off)
+              data[versions_sh_offset+0x20:versions_sh_offset+0x28] = struct.pack('<Q', 64)
+          with open('/data/local/tmp/kernelsu_patched.ko','wb') as f: f.write(data)
+          print('Success! KASLR addresses bound.')
+          PYEOF
+
+          # deploy.sh
+          cat > "$STAGE/deploy.sh" << 'DEPLOY_EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+          cd "$(dirname "$0")"
+
+          echo "[*] Staging files to /data/local/tmp via rish..."
+          rish -c "mkdir -p /data/local/tmp/a"
+          cat kernelsu.ko     | rish -c 'cat > /data/local/tmp/kernelsu_base.ko'
+          cat stock.ko        | rish -c 'cat > /data/local/tmp/stock.ko'
+          cat patch_final.py  | rish -c 'cat > /data/local/tmp/patch_final.py'
+          cat e-r20           | rish -c 'cat > /data/local/tmp/e-r20'
+          cat spray           | rish -c 'cat > /data/local/tmp/spray'
+          rish -c "chmod 755 /data/local/tmp/e-r20 /data/local/tmp/spray"
+
+          cat > r20-root.sh << 'INNER_EOF'
+          #!/system/bin/sh
+          exec >>/data/local/tmp/root-helper.log 2>&1
+          set -x
+          id
+          echo 0 > /proc/sys/kernel/kptr_restrict
+          cat /proc/kallsyms > /data/local/tmp/kallsyms.txt
+          /data/data/com.termux/files/usr/bin/python3 /data/local/tmp/patch_final.py
+          echo u:r:vendor_modprobe:s0 > /proc/self/attr/exec
+          /system/bin/insmod /data/local/tmp/kernelsu_patched.ko
+          echo "[*] insmod rc=$?"
+          dmesg | tail -n 20
+          chmod 644 /data/local/tmp/root-helper.log
+          echo ready > /data/local/tmp/.ghostlock_ksu.status
+          INNER_EOF
+          cat r20-root.sh | rish -c 'cat > /data/local/tmp/a/r20-root.sh'
+          rish -c "chmod 755 /data/local/tmp/a/r20-root.sh"
+
+          echo "[*] Starting execution loop..."
+          while true; do
+              echo "=== NEW ATTEMPT $(date) ==="
+              rish -c 'cd /data/local/tmp && ./e-r20'
+              sleep 3
+              if rish -c "grep -q 'insmod rc=0' /data/local/tmp/root-helper.log" 2>/dev/null; then
+                  echo "SUCCESS! Module loaded."
+                  break
+              fi
+              echo "Failed. Re-running after reboot if necessary."
+              sleep 10
+          done
+          DEPLOY_EOF
+          chmod +x "$STAGE/deploy.sh"
+
+          cd "$STAGE"
+          zip -r /tmp/kernelsu-all-in-one.zip .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernelsu-all-in-one
+          path: /tmp/kernelsu-all-in-one.zip
+          if-no-files-found: error
