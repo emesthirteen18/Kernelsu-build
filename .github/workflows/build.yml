@@ -145,22 +145,26 @@ jobs:
         working-directory: ./kernel_source
         run: |
           set -euo pipefail
-          INIT_C=$(find . -name init.c -path '*/KernelSU/kernel/core/*' -o -name init.c -path '*/kernel/core/*' | head -n1)
+          
+          # Resolve the exact same directory we will build later
+          KSU_DIR=$(realpath drivers/kernelsu)
+          INIT_C=$(find "$KSU_DIR" -name init.c -path "*/core/*" | head -n1)
+          
           if [ -z "$INIT_C" ]; then
-            echo "ERROR: KernelSU core/init.c not found"
+            echo "ERROR: KernelSU core/init.c not found in $KSU_DIR"
             exit 1
           fi
           echo "[+] Target init.c: $INIT_C"
 
           if ! grep -q 'SAFE_LATE_LOAD: skipping rules/cred/escape/hook init' "$INIT_C"; then
             echo "[!] Marker missing — injecting non-eliminable string"
-            cat > /tmp/inject_marker.py << 'PYEOF'
+            python3 - "$INIT_C" <<'PY'
           import sys, pathlib
           p = pathlib.Path(sys.argv[1])
           text = p.read_text()
           marker = '''
           /* SAFE_LATE_LOAD forced marker to prevent DCE */
-          static const char __used safe_late_load_marker[] =
+          static const char __used __attribute__((section(".rodata"))) safe_late_load_marker[] =
               "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";
           '''
           for sig in ("int __init kernelsu_init(void)", "int __init ksu_init(void)", "static int __init kernelsu_init(void)"):
@@ -171,8 +175,7 @@ jobs:
               text = marker + "\n" + text
           p.write_text(text)
           print("[+] Marker injected")
-          PYEOF
-            python3 /tmp/inject_marker.py "$INIT_C"
+          PY
           fi
 
           # Hard verify before we compile
@@ -331,6 +334,8 @@ jobs:
           echo "[+] Building KernelSU module from: $KSU_DIR"
           
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 M="$KSU_DIR" clean
+          
+          # Build the module
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             M="$KSU_DIR" src="$KSU_DIR" \
             CONFIG_KSU=m \
@@ -338,6 +343,10 @@ jobs:
             CFLAGS_MODULE="-mcmodel=large $COMMON_WARN_FLAGS -DCONFIG_KSU_SAFE_LATE_LOAD=1" \
             KBUILD_MODPOST_WARN=1 \
             modules
+          
+          # Verify the string made it into the object file before linking
+          echo "[CHECK] string in object before strip ..."
+          llvm-strings "$KSU_DIR/core/init.o" | grep -q "SAFE_LATE_LOAD" && echo "OK in .o" || { echo "MISSING from .o"; exit 1; }
           
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             M=drivers/dummy_mod \
