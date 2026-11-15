@@ -32,19 +32,31 @@ jobs:
             git build-essential bc bison flex libssl-dev libelf-dev \
             python3 unzip curl wget device-tree-compiler aria2 pahole cpio
 
-      - name: Download Prebuilt AOSP Clang Toolchain (r510928)
+      - name: Download Prebuilt Clang Toolchain (r510928)
+        timeout-minutes: 15
         run: |
-          mkdir -p "$HOME/clang/clang-r510928"
+          set -euo pipefail
+          mkdir -p "$HOME/clang"
           cd "$HOME/clang"
-          echo "Downloading AOSP clang-r510928 archive..."
-          curl -fLSs --retry 3 \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/llvm-r510928/clang-r510928.tar.gz" \
-            -o clang-r510928.tar.gz
-          tar -xzf clang-r510928.tar.gz -C clang-r510928
-          rm -f clang-r510928.tar.gz
+          echo "Downloading Clang r510928 from GitHub mirror..."
+          
+          # Primary mirror (cctv18). Asset is .zip, not .tar.gz!
+          curl -L -f --retry 3 --retry-delay 5 --max-time 600 -o clang-r510928.zip \
+            "https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip"
+            
+          mkdir -p clang-r510928
+          unzip -q clang-r510928.zip -d clang-r510928
+          
+          # Some mirrors nest one extra directory; flatten if needed
+          if [ ! -x clang-r510928/bin/clang ] && [ -d clang-r510928/clang-r510928 ]; then
+            mv clang-r510928/clang-r510928/* clang-r510928/ && rmdir clang-r510928/clang-r510928 || true
+          fi
+          
+          rm -f clang-r510928.zip
           
           test -x "$HOME/clang/clang-r510928/bin/clang" || {
-            echo "ERROR: clang binary missing or not executable!"
+            echo "ERROR: clang binary missing after extract"
+            ls -laR clang-r510928 | head -50
             exit 1
           }
           echo "$HOME/clang/clang-r510928/bin" >> "$GITHUB_PATH"
