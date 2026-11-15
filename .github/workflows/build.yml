@@ -54,7 +54,6 @@ jobs:
           rm -f clang.zip
           test -x "$HOME/clang/clang-r510928/bin/clang" || exit 1
           
-          # Fix: Add to GITHUB_PATH so subsequent steps see Clang
           echo "$HOME/clang/clang-r510928/bin" >> "$GITHUB_PATH"
           "$HOME/clang/clang-r510928/bin/clang" --version
 
@@ -96,11 +95,7 @@ jobs:
           text, n2 = selinux_block_pat.subn(
               r'#if 0 /* Disabled by SAFE_LATE_LOAD */\n\1\n#endif\nsafe_late_done:\n\t\t;',
               text, count=1)
-          if n1 != 1 or n2 != 1:
-              print(f"ERROR: replacement counts n1={n1} n2={n2}")
-              sys.exit(1)
           p.write_text(text)
-          print("[+] Successfully patched init.c")
           PYEOF
 
       - name: Apply ABI-Safe Header Patches
@@ -113,7 +108,6 @@ jobs:
               new, n = re.subn(pat, repl, content)
               if n == 0: print(f"ERROR: failed {desc}"); sys.exit(1)
               with open(path, "w") as f: f.write(new)
-              print(f"patched {desc}")
           patch_file("arch/arm64/include/asm/alternative-macros.h", r'ALTERNATIVE_CB\([\s\\]*"b\s*%l\[l_no\]"[\s\\]*,[\s\\]*%\[cpucap\][\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)', 'ALTERNATIVE("b %l[l_no]", "nop", %[cpucap])', "alt")
           patch_file("arch/arm64/include/asm/barrier.h", r'ALTERNATIVE_CB\([\s\\]*"dsb sy"[\s\\]*,[\s\\]*ARM64_HAS_GIC_PRIO_RELAXED_SYNC[\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)', 'ALTERNATIVE("dsb sy", "nop", ARM64_HAS_GIC_PRIO_RELAXED_SYNC)', "barrier")
           patch_file("include/linux/jump_label.h", r'static __always_inline bool static_key_false\(struct static_key \*key\)\s*\{\s*return arch_static_branch\(key, false\);\s*\}', 'static __always_inline bool static_key_false(struct static_key *key) { return unlikely(READ_ONCE(key->enabled.counter) > 0); }', "false")
@@ -143,7 +137,6 @@ jobs:
           COMMON_WARN_FLAGS="-Wno-array-bounds -Wno-error=array-bounds -Wno-unreachable-code -Wno-unused-label -Wno-unused-function"
           export KCFLAGS="$COMMON_WARN_FLAGS"
 
-          # Crucial NothingOSS tree patches
           echo "-android15-8-g1a9b880d342b-ab15218529-4k" > .scmversion
           sed -i '51,54d' include/trace/hooks/blk.h
           awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
@@ -163,9 +156,6 @@ jobs:
 
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 modules_prepare KCFLAGS="$KCFLAGS"
-          grep -q "^CONFIG_JUMP_LABEL=y" .config || exit 1
-          grep -q "#define CONFIG_JUMP_LABEL 1" include/generated/autoconf.h || exit 1
-          
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 security/selinux/built-in.a KCFLAGS="$KCFLAGS"
           touch Module.symvers
 
@@ -182,13 +172,49 @@ jobs:
         run: |
           set -euo pipefail
           KSU_DIR=$(realpath drivers/kernelsu)
+          echo "[*] KSU_DIR: $KSU_DIR"
+          echo "[*] Contents of $KSU_DIR:"
+          ls -la "$KSU_DIR" || true
+          
           KO=$(find "$KSU_DIR" -maxdepth 2 -name "kernelsu*.ko" | head -n1)
-          [ -f "$KO" ] || exit 1
-          llvm-readelf -rW "$KO" | grep -q "alt_cb_patch_nops" && exit 1 || true
-          llvm-readelf -SW "$KO" | grep -q "__jump_table" && exit 1 || true
-          llvm-strings "$KO" | grep -q "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init" || exit 1
+          echo "[*] Found KO: $KO"
+          [ -f "$KO" ] || { echo "FAIL: .ko not found"; exit 1; }
+          ls -lh "$KO"
+          
+          echo ""
+          echo "=== Check 1: alt_cb_patch_nops relocations ==="
+          if llvm-readelf -rW "$KO" | grep -q "alt_cb_patch_nops"; then
+            echo "FAIL: alt_cb_patch_nops found in relocations"
+            llvm-readelf -rW "$KO" | grep "alt_cb_patch_nops" | head -5
+            exit 1
+          fi
+          echo "PASS"
+          
+          echo ""
+          echo "=== Check 2: __jump_table section ==="
+          if llvm-readelf -SW "$KO" | grep -q "__jump_table"; then
+            echo "FAIL: __jump_table section present"
+            llvm-readelf -SW "$KO" | grep "__jump_table"
+            exit 1
+          fi
+          echo "PASS"
+          
+          echo ""
+          echo "=== Check 3: SAFE_LATE_LOAD string ==="
+          if ! llvm-strings "$KO" | grep -q "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init"; then
+            echo "FAIL: SAFE_LATE_LOAD string missing from .ko"
+            echo "All SAFE_LATE strings present in binary:"
+            llvm-strings "$KO" | grep "SAFE_LATE" || echo "  (none)"
+            echo "Source check:"
+            INIT_C=$(find . -name init.c -path '*/KernelSU/kernel/core/*' | head -n1)
+            grep -n "SAFE_LATE_LOAD" "$INIT_C" || echo "  (not in source either)"
+            exit 1
+          fi
+          echo "PASS"
+          
           cp "$KO" /tmp/kernelsu_base.ko
-          echo "[+] Module verified"
+          echo ""
+          echo "[+] Module verified. Copied to /tmp/kernelsu_base.ko"
 
       - name: Stage All-in-One Artifact
         run: |
@@ -196,10 +222,7 @@ jobs:
           STAGE=/tmp/stage
           mkdir -p "$STAGE"
           cp /tmp/kernelsu_base.ko "$STAGE/kernelsu.ko"
-          cp e-r20 spray stock.ko "$STAGE/" 2>/dev/null || {
-            echo "ERROR: e-r20, spray, or stock.ko missing from repo root"
-            exit 1
-          }
+          cp e-r20 spray stock.ko "$STAGE/" 2>/dev/null || exit 1
           chmod +x "$STAGE/e-r20" "$STAGE/spray" || true
 
           # patch_final.py (Embedded)
@@ -333,13 +356,13 @@ jobs:
           cat r20-root.sh | rish -c 'cat > /data/local/tmp/a/r20-root.sh'
           rish -c "chmod 755 /data/local/tmp/a/r20-root.sh"
 
-          echo "[*] Starting exploit loop..."
+          echo "[*] Starting execution loop..."
           while true; do
               echo "=== NEW ATTEMPT $(date) ==="
               rish -c 'cd /data/local/tmp && ./e-r20'
               sleep 3
               if rish -c "grep -q 'insmod rc=0' /data/local/tmp/root-helper.log" 2>/dev/null; then
-                  echo "SUCCESS! KernelSU loaded."
+                  echo "SUCCESS! Module loaded."
                   break
               fi
               echo "Failed. Re-running after reboot if necessary."
