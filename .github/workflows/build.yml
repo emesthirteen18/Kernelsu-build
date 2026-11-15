@@ -70,92 +70,57 @@ jobs:
           rm -rf KernelSU drivers/kernelsu
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
 
-      - name: Apply Unconditional SAFE_LATE_LOAD Patch
-        working-directory: ./kernel_source
-        run: |
-          cat > /tmp/patch_ksu.py << 'PYEOF'
-          import re
-          import sys
-          from pathlib import Path
-
-          def apply_patch():
-              ksu_link = Path("drivers/kernelsu")
-              if not ksu_link.exists():
-                  print("ERROR: drivers/kernelsu symlink does not exist!")
-                  sys.exit(1)
-
-              ksu_dir = ksu_link.resolve()
-              print(f"[+] Resolved KSU directory: {ksu_dir}")
-
-              candidates = [ksu_dir / "core" / "init.c", ksu_dir / "init.c"]
-              initc_path = next((p for p in candidates if p.exists()), None)
-              if initc_path is None:
-                  print(f"ERROR: init.c not found in {candidates}!")
-                  sys.exit(1)
-
-              print(f"[+] Target init.c: {initc_path}")
-              init_text = initc_path.read_text()
-
-              if "SAFE_LATE_LOAD:" in init_text:
-                  print("[+] init.c already contains SAFE_LATE_LOAD patch.")
-                  return
-
-              anchor1_pat = re.compile(
-                  r'(pr_info\(\s*"late load mode, skipping kprobe hooks\\n"\s*\)\s*;)'
-              )
-              if not anchor1_pat.search(init_text):
-                  print("ERROR: Could not find 'late load mode, skipping kprobe hooks' pr_info in init.c!")
-                  sys.exit(1)
-
-              selinux_block_pat = re.compile(
-                  r'(if\s*\(\s*!getenforce\(\)\s*\)\s*\{[\s\S]*?setenforce\(\s*true\s*\)\s*;\s*\})'
-              )
-              if not selinux_block_pat.search(init_text):
-                  print("ERROR: Could not find 'if (!getenforce()) { ... setenforce(true); }' block in init.c!")
-                  sys.exit(1)
-
-              init_text, n1 = anchor1_pat.subn(
-                  r'\1\n'
-                  r'\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");\n'
-                  r'\t\tksu_boot_completed = true;\n'
-                  r'\t\tgoto safe_late_done;',
-                  init_text,
-                  count=1,
-              )
-
-              init_text, n2 = selinux_block_pat.subn(
-                  r'#if 0 /* Disabled by SAFE_LATE_LOAD */\n\1\n#endif\n'
-                  r'safe_late_done:\n\t\t;',
-                  init_text,
-                  count=1,
-              )
-
-              if n1 != 1 or n2 != 1:
-                  print(f"ERROR: Unexpected replacement counts (n1={n1}, n2={n2})!")
-                  sys.exit(1)
-
-              initc_path.write_text(init_text)
-              print("[+] Successfully patched init.c unconditionally for SAFE_LATE_LOAD.")
-
-          apply_patch()
-          PYEOF
-          python3 /tmp/patch_ksu.py
-
-      - name: Force SAFE_LATE_LOAD marker into init.c
+      - name: Apply SAFE_LATE_LOAD Patch and Force Marker
         working-directory: ./kernel_source
         run: |
           set -euo pipefail
           
-          # Resolve the exact same directory we will build later
-          KSU_DIR=$(realpath drivers/kernelsu)
-          INIT_C=$(find "$KSU_DIR" -name init.c -path "*/core/*" | head -n1)
-          
+          # 1. Locate init.c
+          INIT_C=$(find . -name init.c -path '*/KernelSU/kernel/core/*' | head -n1)
           if [ -z "$INIT_C" ]; then
-            echo "ERROR: KernelSU core/init.c not found in $KSU_DIR"
-            exit 1
+            INIT_C=$(find . -name init.c -path '*/kernel/core/*' | head -n1)
           fi
+          [ -n "$INIT_C" ] || { echo "ERROR: init.c not found"; exit 1; }
           echo "[+] Target init.c: $INIT_C"
 
+          # 2. Apply unconditional logic patch (goto safe_late_done)
+          python3 - "$INIT_C" << 'PYEOF'
+          import re, sys
+          path = sys.argv[1]
+          with open(path, "r") as f:
+              text = f.read()
+
+          anchor1_pat = re.compile(r'(pr_info\(\s*"late load mode, skipping kprobe hooks\\n"\s*\)\s*;)')
+          if not anchor1_pat.search(text):
+              print("ERROR: Could not find 'late load mode, skipping kprobe hooks' pr_info in init.c!")
+              sys.exit(1)
+
+          selinux_block_pat = re.compile(r'(if\s*\(\s*!getenforce\(\)\s*\)\s*\{[\s\S]*?setenforce\(\s*true\s*\)\s*;\s*\})')
+          if not selinux_block_pat.search(text):
+              print("ERROR: Could not find 'if (!getenforce()) { ... setenforce(true); }' block in init.c!")
+              sys.exit(1)
+
+          text, n1 = anchor1_pat.subn(
+              r'\1\n'
+              r'\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");\n'
+              r'\t\tksu_boot_completed = true;\n'
+              r'\t\tgoto safe_late_done;',
+              text, count=1
+          )
+          text, n2 = selinux_block_pat.subn(
+              r'#if 0 /* Disabled by SAFE_LATE_LOAD */\n\1\n#endif\n'
+              r'safe_late_done:\n\t\t;',
+              text, count=1
+          )
+          if n1 != 1 or n2 != 1:
+              print(f"ERROR: Unexpected replacement counts (n1={n1}, n2={n2})!")
+              sys.exit(1)
+          with open(path, "w") as f:
+              f.write(text)
+          print("[+] Successfully patched init.c logic.")
+          PYEOF
+
+          # 3. Force inject the __used marker to survive DCE
           if ! grep -q 'SAFE_LATE_LOAD: skipping rules/cred/escape/hook init' "$INIT_C"; then
             echo "[!] Marker missing — injecting non-eliminable string"
             python3 - "$INIT_C" <<'PY'
@@ -174,13 +139,13 @@ jobs:
           else:
               text = marker + "\n" + text
           p.write_text(text)
-          print("[+] Marker injected")
+          print("[+] Marker injected at top of function.")
           PY
           fi
 
-          # Hard verify before we compile
-          grep -n 'SAFE_LATE_LOAD: skipping rules/cred/escape/hook init' "$INIT_C" || {
-            echo "ERROR: marker still missing from $INIT_C after injection"
+          # 4. Verify source
+          grep -q 'SAFE_LATE_LOAD: skipping rules/cred/escape/hook init' "$INIT_C" || {
+            echo "ERROR: marker missing after injection"
             exit 1
           }
           echo "[+] Marker confirmed in source"
@@ -346,7 +311,14 @@ jobs:
           
           # Verify the string made it into the object file before linking
           echo "[CHECK] string in object before strip ..."
-          llvm-strings "$KSU_DIR/core/init.o" | grep -q "SAFE_LATE_LOAD" && echo "OK in .o" || { echo "MISSING from .o"; exit 1; }
+          if llvm-strings "$KSU_DIR/core/init.o" 2>/dev/null | grep -q "SAFE_LATE_LOAD"; then
+            echo "OK in .o"
+          elif grep -a -q "SAFE_LATE_LOAD" "$KSU_DIR/core/init.o"; then
+            echo "OK in .o (raw grep)"
+          else
+            echo "MISSING from .o"
+            exit 1
+          fi
           
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             M=drivers/dummy_mod \
