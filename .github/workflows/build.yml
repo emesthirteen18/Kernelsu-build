@@ -141,38 +141,46 @@ jobs:
           PYEOF
           python3 /tmp/patch_ksu.py
 
-      - name: Ensure SAFE_LATE_LOAD string is present and non-eliminable
+      - name: Force SAFE_LATE_LOAD marker into init.c
         working-directory: ./kernel_source
         run: |
           set -euo pipefail
-          INIT_C=$(find . -path '*/KernelSU/kernel/core/init.c' -o -path '*/drivers/kernelsu/core/init.c' -o -path '*/kernel/core/init.c' | head -n1)
+          INIT_C=$(find . -name init.c -path '*/KernelSU/kernel/core/*' -o -name init.c -path '*/kernel/core/*' | head -n1)
           if [ -z "$INIT_C" ]; then
-            echo "ERROR: could not locate KernelSU init.c"
+            echo "ERROR: KernelSU core/init.c not found"
             exit 1
           fi
-          echo "[+] init.c at: $INIT_C"
+          echo "[+] Target init.c: $INIT_C"
 
           if ! grep -q 'SAFE_LATE_LOAD: skipping rules/cred/escape/hook init' "$INIT_C"; then
-            echo "[!] string missing from source — injecting forced-used marker"
-            python3 - "$INIT_C" <<'PY'
-          import sys
-          import pathlib
+            echo "[!] Marker missing — injecting non-eliminable string"
+            cat > /tmp/inject_marker.py << 'PYEOF'
+          import sys, pathlib
           p = pathlib.Path(sys.argv[1])
           text = p.read_text()
-          marker = 'static const char __attribute__((used)) safe_late_load_marker[] = "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";\n'
-          if 'safe_late_load_marker' in text:
-              print("[+] marker already present")
+          marker = '''
+          /* SAFE_LATE_LOAD forced marker to prevent DCE */
+          static const char __used safe_late_load_marker[] =
+              "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";
+          '''
+          for sig in ("int __init kernelsu_init(void)", "int __init ksu_init(void)", "static int __init kernelsu_init(void)"):
+              if sig in text:
+                  text = text.replace(sig, sig + "\n" + marker, 1)
+                  break
           else:
-              p.write_text(marker + text)
-              print("[+] marker injected at top of file")
-          PY
+              text = marker + "\n" + text
+          p.write_text(text)
+          print("[+] Marker injected")
+          PYEOF
+            python3 /tmp/inject_marker.py "$INIT_C"
           fi
 
+          # Hard verify before we compile
           grep -n 'SAFE_LATE_LOAD: skipping rules/cred/escape/hook init' "$INIT_C" || {
-            echo "ERROR: failed to place SAFE_LATE_LOAD string in $INIT_C"
+            echo "ERROR: marker still missing from $INIT_C after injection"
             exit 1
           }
-          echo "[+] SAFE_LATE_LOAD string confirmed in source"
+          echo "[+] Marker confirmed in source"
 
       - name: Apply ABI-Safe Header Patches (Header-Order Safe READ_ONCE Fix)
         working-directory: ./kernel_source
