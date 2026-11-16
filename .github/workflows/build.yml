@@ -62,6 +62,10 @@ jobs:
         run: |
           rm -rf KernelSU drivers/kernelsu
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
+          
+          # Print the version so we can verify it's 35262+
+          echo "=== BakaSU Version Check ==="
+          cat KernelSU/kernel/version.h || true
 
       - name: Apply SAFE_LATE_LOAD Patch and Marker
         working-directory: ./kernel_source
@@ -189,7 +193,7 @@ jobs:
           fi
           echo "PASS: No __jump_table"
           
-          # Check 3 (SIGPIPE FIX: Capture output first)
+          # Check 3 (SIGPIPE FIX)
           STRINGS_OUT=$(llvm-strings "$KO")
           if ! echo "$STRINGS_OUT" | grep -F "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init" > /dev/null; then
             echo "FAIL: SAFE_LATE_LOAD string missing from .ko"
@@ -333,7 +337,7 @@ jobs:
           cat /proc/kallsyms > /data/local/tmp/kallsyms.txt
           /data/data/com.termux/files/usr/bin/python3 /data/local/tmp/patch_final.py
           echo u:r:vendor_modprobe:s0 > /proc/self/attr/exec
-          /system/bin/insmod /data/local/tmp/kernelsu_patched.ko
+          /system/bin/insmod /data/local/tmp/kernelsu_patched.ko allow_shell=1
           echo "[*] insmod rc=$?"
           dmesg | tail -n 20
           chmod 644 /data/local/tmp/root-helper.log
