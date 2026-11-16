@@ -1,32 +1,47 @@
-name: Build KernelSU Module (NothingOSS ABI-Safe All-in-One)
+name: Build BakaSU Late-Load All-In-One (NothingOSS SM7750)
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      bakasu_ref:
+        description: 'BakaSU tag/branch override (leave empty for auto-latest)'
+        required: false
+        default: ''
+
+env:
+  ARCH: arm64
+  CLANG_REVISION: r510928
+  KMI_GENERATION: android15-6.6
 
 jobs:
-  build:
+  build-kernelsu-lkm:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - name: Maximize build space
-        uses: easimon/maximize-build-space@master
+        uses: easimon/maximize-build-space@v10
         with:
           root-reserve-mb: 12288
           temp-reserve-mb: 4096
           swap-size-mb: 8192
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
 
       - name: Checkout user repo (e-r20, spray, stock.ko)
         uses: actions/checkout@v4
+        with:
+          path: workspace-repo
 
       - name: Checkout Nothing Kernel Source
         uses: actions/checkout@v4
         with:
-          repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
-          ref: 'sm7750/b/FroggerPro'
-          path: 'kernel_source'
+          repository: NothingOSS/android_kernel_msm-6.6_nothing_sm7750
+          ref: sm7750/b/FroggerPro
+          path: kernel_source
           fetch-depth: 1
 
       - name: Install Build Dependencies
@@ -34,7 +49,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             git build-essential bc bison flex libssl-dev libelf-dev \
-            python3 unzip curl wget device-tree-compiler aria2 pahole cpio zip
+            python3 unzip curl wget device-tree-compiler aria2 pahole cpio zip zstd jq
 
       - name: Download Prebuilt Clang Toolchain (r510928)
         timeout-minutes: 15
@@ -53,44 +68,88 @@ jobs:
           rm -rf clang-r510928/runtimes_ndk_cxx || true
           rm -f clang.zip
           test -x "$HOME/clang/clang-r510928/bin/clang" || exit 1
-          
           echo "$HOME/clang/clang-r510928/bin" >> "$GITHUB_PATH"
-          "$HOME/clang/clang-r510928/bin/clang" --version
+          clang --version
 
-      - name: Integrate BakaSU
+      - name: Resolve Latest BakaSU Release Tag
+        id: bakasu_version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ github.event.inputs.bakasu_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_REF}" ]; then
+            BAKASU_REF="${INPUT_REF}"
+          else
+            BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/Baka-SU/BakaSU/releases?per_page=1" \
+              | jq -r '.[0].tag_name // empty')
+            if [ -z "${BAKASU_REF}" ] || [ "${BAKASU_REF}" = "null" ]; then
+              BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/repos/Baka-SU/BakaSU/tags?per_page=1" \
+                | jq -r '.[0].name // "main"')
+            fi
+          fi
+          echo "BAKASU_REF=${BAKASU_REF}" >> "$GITHUB_ENV"
+          echo "Resolved BakaSU ref: ${BAKASU_REF}"
+
+      - name: Download ksud and Manager APK from Release
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifact_bundle"
+          ASSETS=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+            "https://api.github.com/repos/Baka-SU/BakaSU/releases/tags/${BAKASU_REF}" || echo '{}')
+          KSUD_URL=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | contains("ksud-aarch64-linux-android")) | .browser_download_url' | head -n1)
+          if [ -n "$KSUD_URL" ] && [ "$KSUD_URL" != "null" ]; then
+            curl -L -o "$GITHUB_WORKSPACE/artifact_bundle/ksud" "$KSUD_URL"
+            chmod +x "$GITHUB_WORKSPACE/artifact_bundle/ksud"
+          else
+            echo "Warning: Could not find ksud in release assets"
+          fi
+          MGR_URL=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | contains("Manager-release.zip")) | .browser_download_url' | head -n1)
+          if [ -n "$MGR_URL" ] && [ "$MGR_URL" != "null" ]; then
+            curl -L -o /tmp/manager.zip "$MGR_URL"
+            unzip -o -j /tmp/manager.zip "*arm64-v8a-release.apk" -d "$GITHUB_WORKSPACE/artifact_bundle/" || true
+          else
+            echo "Warning: Could not find Manager APK in release assets"
+          fi
+
+      - name: Integrate BakaSU & Enforce CONFIG_KSU_DEBUG
         working-directory: ./kernel_source
         run: |
+          set -euo pipefail
           rm -rf KernelSU drivers/kernelsu
-          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash
-          
-          # Print the version so we can verify it's 35262+
-          echo "=== BakaSU Version Check ==="
-          cat KernelSU/kernel/version.h || true
+          curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/${BAKASU_REF}/kernel/setup.sh" \
+            | bash -s "${BAKASU_REF}"
+          KBUILD_FILE=$(find KernelSU/ drivers/kernelsu/ -maxdepth 2 \( -name "Kbuild" -o -name "Makefile" \) 2>/dev/null | head -n1)
+          [ -n "${KBUILD_FILE}" ] || { echo "FATAL: BakaSU Kbuild not found"; exit 1; }
+          cat << 'EOF' >> "${KBUILD_FILE}"
+          CONFIG_KSU := m
+          CONFIG_KSU_DEBUG := y
+          ccflags-y += -DCONFIG_KSU_DEBUG=1 -DCONFIG_KSU_SAFE_LATE_LOAD=1
+          EOF
+          cat << 'EOF' >> arch/arm64/configs/gki_defconfig
+          CONFIG_KSU=m
+          CONFIG_KSU_DEBUG=y
+          EOF
 
-      - name: Apply SAFE_LATE_LOAD Patch and Marker
+      - name: Apply SAFE_LATE_LOAD Patch and ABI Fixes
         working-directory: ./kernel_source
         run: |
           set -euo pipefail
           INIT_C=$(find . -name init.c -path '*/KernelSU/kernel/core/*' | head -n1)
           [ -n "$INIT_C" ] || { echo "ERROR: init.c not found"; exit 1; }
-          echo "[+] Target init.c: $INIT_C"
-
           python3 - "$INIT_C" <<'PYEOF'
           import re, sys, pathlib
-          p = pathlib.Path(sys.argv[1])
-          text = p.read_text()
-
+          p = pathlib.Path(sys.argv[1]); text = p.read_text()
           marker = '''
-          /* SAFE_LATE_LOAD forced marker */
           static const char __used __attribute__((section(".rodata"))) safe_late_load_marker[] =
               "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";
           '''
-          if 'SAFE_LATE_LOAD: skipping rules/cred/escape/hook init' not in text:
+          if 'SAFE_LATE_LOAD: skipping' not in text:
               text = marker + "\n" + text
-          if '(void)safe_late_load_marker;' not in text:
-              pattern = r'(int\s+__init\s+(?:kernelsu_init|ksu_init)\s*\([^)]*\)\s*\{)'
-              text, n_ref = re.subn(pattern, r'\1\n  (void)safe_late_load_marker;', text, count=1)
-
+          text = re.sub(r'(int\s+__init\s+(?:kernelsu_init|ksu_init)\s*\([^)]*\)\s*\{)',
+                        r'\1\n  (void)safe_late_load_marker;', text, count=1)
           anchor1_pat = re.compile(r'(pr_info\(\s*"late load mode, skipping kprobe hooks\\n"\s*\)\s*;)')
           selinux_block_pat = re.compile(r'(if\s*\(\s*!getenforce\(\)\s*\)\s*\{[\s\S]*?setenforce\(\s*true\s*\)\s*;\s*\})')
           text, n1 = anchor1_pat.subn(
@@ -99,34 +158,23 @@ jobs:
           text, n2 = selinux_block_pat.subn(
               r'#if 0 /* Disabled by SAFE_LATE_LOAD */\n\1\n#endif\nsafe_late_done:\n\t\t;',
               text, count=1)
+          assert n1 == 1 and n2 == 1, f"SAFE_LATE_LOAD anchors failed: n1={n1}, n2={n2}"
           p.write_text(text)
           PYEOF
-
-      - name: Apply ABI-Safe Header Patches
-        working-directory: ./kernel_source
-        run: |
           python3 - << 'PY'
           import re, sys
-          def patch_file(path, pat, repl, desc):
-              with open(path, "r") as f: content = f.read()
-              new, n = re.subn(pat, repl, content)
-              if n == 0: print(f"ERROR: failed {desc}"); sys.exit(1)
-              with open(path, "w") as f: f.write(new)
-          patch_file("arch/arm64/include/asm/alternative-macros.h", r'ALTERNATIVE_CB\([\s\\]*"b\s*%l\[l_no\]"[\s\\]*,[\s\\]*%\[cpucap\][\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)', 'ALTERNATIVE("b %l[l_no]", "nop", %[cpucap])', "alt")
-          patch_file("arch/arm64/include/asm/barrier.h", r'ALTERNATIVE_CB\([\s\\]*"dsb sy"[\s\\]*,[\s\\]*ARM64_HAS_GIC_PRIO_RELAXED_SYNC[\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)', 'ALTERNATIVE("dsb sy", "nop", ARM64_HAS_GIC_PRIO_RELAXED_SYNC)', "barrier")
-          patch_file("include/linux/jump_label.h", r'static __always_inline bool static_key_false\(struct static_key \*key\)\s*\{\s*return arch_static_branch\(key, false\);\s*\}', 'static __always_inline bool static_key_false(struct static_key *key) { return unlikely(READ_ONCE(key->enabled.counter) > 0); }', "false")
-          patch_file("include/linux/jump_label.h", r'static __always_inline bool static_key_true\(struct static_key \*key\)\s*\{\s*return !arch_static_branch\(key, true\);\s*\}', 'static __always_inline bool static_key_true(struct static_key *key) { return likely(READ_ONCE(key->enabled.counter) > 0); }', "true")
-          patch_file("include/linux/jump_label.h", r'!\s*arch_static_branch(?:_jump)?\(&\(x\)->key,\s*true\)', '(READ_ONCE((x)->key.enabled.counter) > 0)', "likely")
-          patch_file("include/linux/jump_label.h", r'arch_static_branch(?:_jump)?\(&\(x\)->key,\s*false\)', '(READ_ONCE((x)->key.enabled.counter) > 0)', "unlikely")
+          def patch(path, pat, repl, desc):
+              with open(path) as f: c = f.read()
+              n = re.subn(pat, repl, c)
+              if n[1] == 0: sys.exit(f"FAILED: {desc}")
+              with open(path, 'w') as f: f.write(n[0])
+          patch("arch/arm64/include/asm/alternative-macros.h", r'ALTERNATIVE_CB\([\s\\]*"b\s*%l\[l_no\]"[\s\\]*,[\s\\]*%\[cpucap\][\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)', 'ALTERNATIVE("b %l[l_no]", "nop", %[cpucap])', "alt")
+          patch("arch/arm64/include/asm/barrier.h", r'ALTERNATIVE_CB\([\s\\]*"dsb sy"[\s\\]*,[\s\\]*ARM64_HAS_GIC_PRIO_RELAXED_SYNC[\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)', 'ALTERNATIVE("dsb sy", "nop", ARM64_HAS_GIC_PRIO_RELAXED_SYNC)', "barrier")
+          patch("include/linux/jump_label.h", r'static __always_inline bool static_key_false\(struct static_key \*key\)\s*\{\s*return arch_static_branch\(key, false\);\s*\}', 'static __always_inline bool static_key_false(struct static_key *key) { return unlikely(READ_ONCE(key->enabled.counter) > 0); }', "false")
+          patch("include/linux/jump_label.h", r'static __always_inline bool static_key_true\(struct static_key \*key\)\s*\{\s*return !arch_static_branch\(key, true\);\s*\}', 'static __always_inline bool static_key_true(struct static_key *key) { return likely(READ_ONCE(key->enabled.counter) > 0); }', "true")
           PY
-
-      - name: Patch libbpf
-        working-directory: ./kernel_source
-        run: |
           LIBBPF="tools/lib/bpf/libbpf.c"
-          if [ -f "$LIBBPF" ] && grep -q 'char \*next_path;' "$LIBBPF"; then
-            sed -i 's/char \*next_path;/const char *next_path;/' "$LIBBPF"
-          fi
+          [ -f "$LIBBPF" ] && sed -i 's/char \*next_path;/const char *next_path;/' "$LIBBPF" || true
           echo "HOSTCFLAGS=-Wno-error=incompatible-pointer-types-discards-qualifiers" >> "$GITHUB_ENV"
 
       - name: Compile Module
@@ -138,85 +186,57 @@ jobs:
           export STRIP=llvm-strip READELF=llvm-readelf HOSTCC=clang HOSTLD=ld.lld
           export HOSTCFLAGS="-Wno-error=incompatible-pointer-types-discards-qualifiers"
           export KBUILD_MODPOST_WARN=1
-          COMMON_WARN_FLAGS="-Wno-array-bounds -Wno-error=array-bounds -Wno-unreachable-code -Wno-unused-label -Wno-unused-function"
-          export KCFLAGS="$COMMON_WARN_FLAGS"
-
+          COMMON="-Wno-array-bounds -Wno-error=array-bounds -Wno-unreachable-code -Wno-unused-label -Wno-unused-function"
           echo "-android15-8-g1a9b880d342b-ab15218529-4k" > .scmversion
           sed -i '51,54d' include/trace/hooks/blk.h
           awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
-            drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && \
-            mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
-
+            drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
-          scripts/config --enable CONFIG_MODULES
-          scripts/config --enable CONFIG_MODULE_UNLOAD
-          scripts/config --disable CONFIG_MODULE_SIG
-          scripts/config --disable CONFIG_MODULE_SIG_FORCE
-          scripts/config --disable CONFIG_WERROR
+          scripts/config --enable CONFIG_MODULES --enable CONFIG_MODULE_UNLOAD
+          scripts/config --disable CONFIG_MODULE_SIG --disable CONFIG_MODULE_SIG_FORCE --disable CONFIG_WERROR
           scripts/config --module CONFIG_KSU
+          scripts/config --enable CONFIG_KSU_DEBUG
           scripts/config --disable CONFIG_LOCALVERSION_AUTO
           scripts/config --set-str CONFIG_LOCALVERSION ""
-
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
-          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 modules_prepare KCFLAGS="$KCFLAGS"
-          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 security/selinux/built-in.a KCFLAGS="$KCFLAGS"
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 modules_prepare KCFLAGS="$COMMON"
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 security/selinux/built-in.a KCFLAGS="$COMMON"
           touch Module.symvers
-
           KSU_DIR=$(realpath drivers/kernelsu)
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 M="$KSU_DIR" clean
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            M="$KSU_DIR" src="$KSU_DIR" CONFIG_KSU=m \
-            KCFLAGS="$KCFLAGS -DCONFIG_KSU_SAFE_LATE_LOAD=1" \
-            CFLAGS_MODULE="-mcmodel=large $COMMON_WARN_FLAGS -DCONFIG_KSU_SAFE_LATE_LOAD=1" \
+            M="$KSU_DIR" src="$KSU_DIR" CONFIG_KSU=m CONFIG_KSU_DEBUG=y \
+            KCFLAGS="$COMMON -DCONFIG_KSU_SAFE_LATE_LOAD=1 -DCONFIG_KSU_DEBUG=1" \
+            CFLAGS_MODULE="-mcmodel=large $COMMON -DCONFIG_KSU_SAFE_LATE_LOAD=1 -DCONFIG_KSU_DEBUG=1" \
             KBUILD_MODPOST_WARN=1 modules
+          KO=$(find "$KSU_DIR" -maxdepth 2 -name "kernelsu*.ko" | head -n1)
+          cp "$KO" "$GITHUB_WORKSPACE/artifact_bundle/kernelsu.ko"
 
       - name: Verify Module
-        working-directory: ./kernel_source
         run: |
           set -euo pipefail
-          KSU_DIR=$(realpath drivers/kernelsu)
-          KO=$(find "$KSU_DIR" -maxdepth 2 -name "kernelsu*.ko" | head -n1)
-          [ -f "$KO" ] || { echo "FAIL: .ko not found"; exit 1; }
-          
-          # Check 1
+          KO="$GITHUB_WORKSPACE/artifact_bundle/kernelsu.ko"
+          if ! llvm-nm "$KO" | grep -qE "ksu_debug_manager_appid|ksu_debug_manager_uid"; then
+            echo "FATAL: CONFIG_KSU_DEBUG symbols missing"; exit 1
+          fi
           if llvm-readelf -rW "$KO" | grep -q "alt_cb_patch_nops"; then
-            echo "FAIL: alt_cb_patch_nops found"
-            exit 1
+            echo "FAIL: alt_cb_patch_nops found"; exit 1
           fi
-          echo "PASS: No alt_cb_patch_nops"
-          
-          # Check 2
           if llvm-readelf -SW "$KO" | grep -q "__jump_table"; then
-            echo "FAIL: __jump_table present"
-            exit 1
+            echo "FAIL: __jump_table present"; exit 1
           fi
-          echo "PASS: No __jump_table"
-          
-          # Check 3 (SIGPIPE FIX)
-          STRINGS_OUT=$(llvm-strings "$KO")
-          if ! echo "$STRINGS_OUT" | grep -F "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init" > /dev/null; then
-            echo "FAIL: SAFE_LATE_LOAD string missing from .ko"
-            exit 1
+          if ! llvm-strings "$KO" | grep -Fq "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init"; then
+            echo "FAIL: SAFE_LATE_LOAD string missing"; exit 1
           fi
-          echo "PASS: SAFE_LATE_LOAD string present"
-          
-          cp "$KO" /tmp/kernelsu_base.ko
-          echo "[+] Module verified. Copied to /tmp/kernelsu_base.ko"
+          if llvm-readelf -r "$KO" | grep -qE "R_AARCH64_JUMP_SLOT|R_AARCH64_GLOB_DAT"; then
+            echo "FATAL: forbidden GOT/PLT relocations"; exit 1
+          fi
+          echo "PASS: module verified"
 
-      - name: Stage All-in-One Artifact
+      - name: Generate patch_final.py (exact SHN_ABS binder)
         run: |
-          set -euo pipefail
-          STAGE=/tmp/stage
-          mkdir -p "$STAGE"
-          cp /tmp/kernelsu_base.ko "$STAGE/kernelsu.ko"
-          
-          # Copy binaries from repo root
-          cp e-r20 spray stock.ko "$STAGE/"
-          chmod +x "$STAGE/e-r20" "$STAGE/spray" || true
-
-          # patch_final.py (Embedded)
-          cat > "$STAGE/patch_final.py" << 'PYEOF'
+          cat << 'PYEOF' > "$GITHUB_WORKSPACE/artifact_bundle/patch_final.py"
           import struct, sys
           ko_path = '/data/local/tmp/kernelsu_base.ko'
           stock_ko = '/data/local/tmp/stock.ko'
@@ -314,20 +334,96 @@ jobs:
           print('Success! KASLR addresses bound.')
           PYEOF
 
-          # deploy.sh
-          cat > "$STAGE/deploy.sh" << 'DEPLOY_EOF'
+      - name: Generate gen_allowlist.py
+        run: |
+          cat << 'PYEOF' > "$GITHUB_WORKSPACE/artifact_bundle/gen_allowlist.py"
+          import ctypes, struct, sys, os
+          KSU_APP_PROFILE_VER = 2
+          KSU_MAX_PACKAGE_NAME = 256
+          KSU_MAX_GROUPS = 32
+          KSU_SELINUX_DOMAIN = 64
+          class root_profile(ctypes.Structure):
+              _fields_ = [
+                  ("uid", ctypes.c_int32), ("gid", ctypes.c_int32),
+                  ("groups_count", ctypes.c_int32), ("groups", ctypes.c_int32 * KSU_MAX_GROUPS),
+                  ("capabilities", ctypes.c_uint64 * 3), ("selinux_domain", ctypes.c_char * KSU_SELINUX_DOMAIN),
+                  ("namespaces", ctypes.c_int32),
+              ]
+          class app_profile(ctypes.Structure):
+              _fields_ = [
+                  ("version", ctypes.c_uint32), ("key", ctypes.c_char * KSU_MAX_PACKAGE_NAME),
+                  ("current_uid", ctypes.c_int32), ("allow_su", ctypes.c_bool),
+                  ("rp_config_use_default", ctypes.c_bool), ("rp_config_template_name", ctypes.c_char * KSU_MAX_PACKAGE_NAME),
+                  ("rp_config_profile", root_profile),
+              ]
+          def make_profile(pkg, uid):
+              p = app_profile()
+              p.version = KSU_APP_PROFILE_VER
+              p.key = pkg.encode()
+              p.current_uid = uid
+              p.allow_su = True
+              p.rp_config_use_default = False
+              p.rp_config_profile.uid = 0
+              p.rp_config_profile.gid = 0
+              p.rp_config_profile.groups_count = 1
+              p.rp_config_profile.groups[0] = 0
+              for i in range(3):
+                  p.rp_config_profile.capabilities[i] = 0xFFFFFFFFFFFFFFFF
+              p.rp_config_profile.selinux_domain = b"u:r:su:s0"
+              return bytes(p)
+          def main():
+              if len(sys.argv) < 3:
+                  print(f"Usage: {sys.argv[0]} <path> <pkg:uid> [...]")
+                  sys.exit(1)
+              path = sys.argv[1]
+              targets = sys.argv[2:]
+              header = struct.pack("<II", 0x7f4b5355, 3)
+              records = []
+              if os.path.exists(path) and os.path.getsize(path) >= 8 + 768:
+                  with open(path, "rb") as f: data = f.read()
+                  if struct.unpack("<I", data[:4])[0] == 0x7f4b5355:
+                      header = data[:8]
+                      for i in range(8, len(data), 768):
+                          if len(data[i:i+768]) == 768:
+                              records.append(bytearray(data[i:i+768]))
+              for item in targets:
+                  pkg, uid_str = item.split(":", 1)
+                  uid = int(uid_str)
+                  new_rec = bytearray(make_profile(pkg, uid))
+                  replaced = False
+                  for idx, existing in enumerate(records):
+                      if struct.unpack_from("<i", existing, 260)[0] == uid:
+                          records[idx] = new_rec
+                          replaced = True
+                          break
+                  if not replaced:
+                      records.append(new_rec)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "wb") as f:
+                  f.write(header + b"".join(records))
+              os.chmod(path, 0o600)
+              print(f"Saved {len(records)} records to {path}")
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+      - name: Generate deploy.sh
+        run: |
+          cat << 'EOF' > "$GITHUB_WORKSPACE/artifact_bundle/deploy.sh"
           #!/data/data/com.termux/files/usr/bin/bash
           cd "$(dirname "$0")"
-
           echo "[*] Staging files to /data/local/tmp via rish..."
           rish -c "mkdir -p /data/local/tmp/a"
           cat kernelsu.ko     | rish -c 'cat > /data/local/tmp/kernelsu_base.ko'
           cat stock.ko        | rish -c 'cat > /data/local/tmp/stock.ko'
           cat patch_final.py  | rish -c 'cat > /data/local/tmp/patch_final.py'
+          cat gen_allowlist.py| rish -c 'cat > /data/local/tmp/gen_allowlist.py'
           cat e-r20           | rish -c 'cat > /data/local/tmp/e-r20'
           cat spray           | rish -c 'cat > /data/local/tmp/spray'
+          if [ -f ksud ]; then
+            cat ksud | rish -c 'cat > /data/local/tmp/ksud && chmod 755 /data/local/tmp/ksud'
+          fi
           rish -c "chmod 755 /data/local/tmp/e-r20 /data/local/tmp/spray"
-
           cat > r20-root.sh << 'INNER_EOF'
           #!/system/bin/sh
           exec >>/data/local/tmp/root-helper.log 2>&1
@@ -339,13 +435,30 @@ jobs:
           echo u:r:vendor_modprobe:s0 > /proc/self/attr/exec
           /system/bin/insmod /data/local/tmp/kernelsu_patched.ko allow_shell=1
           echo "[*] insmod rc=$?"
+          mkdir -p /data/adb /data/adb/ksu/bin /data/adb/ksu/log /data/adb/modules
+          chmod 700 /data/adb && chmod 755 /data/adb/ksu /data/adb/ksu/bin /data/adb/ksu/log
+          [ -f /data/local/tmp/ksud ] && cp -f /data/local/tmp/ksud /data/adb/ksud && chmod 755 /data/adb/ksud
+          PKG=$(pm list packages | grep -E 'com\.resukisu\.resukisu|org\.bakasu\.bakasu' | head -n1 | cut -d: -f2 | tr -d '\r')
+          [ -z "$PKG" ] && PKG="com.resukisu.resukisu"
+          MGR_UID=$(stat -c '%u' "/data/user/0/$PKG" 2>/dev/null || echo "")
+          if [ -n "$MGR_UID" ]; then
+              for P in /sys/module/kernelsu/parameters/ksu_debug_manager_appid /sys/module/kernelsu/parameters/ksu_debug_manager_uid; do
+                  [ -e "$P" ] && echo "$MGR_UID" > "$P"
+              done
+              /data/data/com.termux/files/usr/bin/python3 /data/local/tmp/gen_allowlist.py /data/adb/ksu/.allowlist "com.termux:10367" "$PKG:$MGR_UID" || true
+          else
+              /data/data/com.termux/files/usr/bin/python3 /data/local/tmp/gen_allowlist.py /data/adb/ksu/.allowlist "com.termux:10367" || true
+          fi
+          PREV_SE=$(getenforce)
+          setenforce 0
+          /data/adb/ksud late-load --allow-shell --package-name "$PKG" --kmi android15-6.6 || true
+          [ "$PREV_SE" = "Enforcing" ] && setenforce 1
           dmesg | tail -n 20
           chmod 644 /data/local/tmp/root-helper.log
           echo ready > /data/local/tmp/.ghostlock_ksu.status
           INNER_EOF
           cat r20-root.sh | rish -c 'cat > /data/local/tmp/a/r20-root.sh'
           rish -c "chmod 755 /data/local/tmp/a/r20-root.sh"
-
           echo "[*] Starting execution loop..."
           while true; do
               echo "=== NEW ATTEMPT $(date) ==="
@@ -358,15 +471,31 @@ jobs:
               echo "Failed. Re-running after reboot if necessary."
               sleep 10
           done
-          DEPLOY_EOF
-          chmod +x "$STAGE/deploy.sh"
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/artifact_bundle/deploy.sh"
 
-          cd "$STAGE"
-          zip -r /tmp/kernelsu-all-in-one.zip .
+      - name: Copy Exploit Binaries & Package
+        run: |
+          set -euo pipefail
+          B="$GITHUB_WORKSPACE/artifact_bundle"
+          for f in e-r20 spray stock.ko; do
+            F=$(find "$GITHUB_WORKSPACE/workspace-repo" -name "$f" | head -n1)
+            [ -n "$F" ] || { echo "FATAL: missing $f in workspace-repo"; exit 1; }
+            cp "$F" "$B/$f"
+          done
+          chmod +x "$B/e-r20" "$B/spray"
+          cat > "$B/BUILD_INFO.txt" << EOF
+          BakaSU Ref      : ${BAKASU_REF}
+          KMI Target      : ${KMI_GENERATION}
+          Clang           : ${CLANG_REVISION}
+          Debug Enabled   : CONFIG_KSU_DEBUG=y
+          Timestamp       : $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          cd "$B" && zip -r9 "$GITHUB_WORKSPACE/kernelsu-all-in-one.zip" .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: kernelsu-all-in-one
-          path: /tmp/kernelsu-all-in-one.zip
-          if-no-files-found: error
+          path: ${{ github.workspace }}/kernelsu-all-in-one.zip
+          retention-days: 30
