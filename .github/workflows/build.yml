@@ -123,6 +123,13 @@ jobs:
             | bash -s "${BAKASU_REF}"
           KBUILD_FILE=$(find KernelSU/ drivers/kernelsu/ -maxdepth 2 \( -name "Kbuild" -o -name "Makefile" \) 2>/dev/null | head -n1)
           [ -n "${KBUILD_FILE}" ] || { echo "FATAL: BakaSU Kbuild not found"; exit 1; }
+
+          # Register BakaSU Kconfig so CONFIG_KSU_DEBUG reaches auto.conf
+          KCONFIG_FILE=$(find KernelSU/ drivers/kernelsu/ -maxdepth 2 -name "Kconfig" 2>/dev/null | head -n1)
+          if [ -n "${KCONFIG_FILE}" ] && ! grep -q "kernelsu" drivers/Kconfig 2>/dev/null; then
+            echo "source \"drivers/kernelsu/Kconfig\"" >> drivers/Kconfig || true
+          fi
+
           cat << 'EOF' >> "${KBUILD_FILE}"
           CONFIG_KSU := m
           CONFIG_KSU_DEBUG := y
