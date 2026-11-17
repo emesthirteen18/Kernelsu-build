@@ -84,7 +84,7 @@ jobs:
             BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
               "https://api.github.com/repos/Baka-SU/BakaSU/releases?per_page=1" \
               | jq -r '.[0].tag_name // empty')
-            if [ -z "${BAKASU_REF}" ] || [ "${BAKASU_REF}" = "null" ]; then
+            if [ -z "\( {BAKASU_REF}" ] || [ " \){BAKASU_REF}" = "null" ]; then
               BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
                 "https://api.github.com/repos/Baka-SU/BakaSU/tags?per_page=1" \
                 | jq -r '.[0].name // "main"')
@@ -141,7 +141,7 @@ jobs:
             echo "CONFIG_KSU_DEBUG := y"
             echo "ccflags-y += -DCONFIG_KSU_DEBUG=1 -DCONFIG_KSU_SAFE_LATE_LOAD=1"
             cat "${KBUILD_FILE}"
-          } > "${KBUILD_FILE}.tmp" && mv "${KBUILD_FILE}.tmp" "${KBUILD_FILE}"
+          } > "\( {KBUILD_FILE}.tmp" && mv " \){KBUILD_FILE}.tmp" "${KBUILD_FILE}"
 
           cat << 'EOF' >> arch/arm64/configs/gki_defconfig
           CONFIG_KSU=m
@@ -152,20 +152,16 @@ jobs:
         working-directory: ./kernel_source
         run: |
           set -euo pipefail
-          INIT_C=$(find KernelSU/kernel -maxdepth 3 -name init.c | head -n1)
-          [ -n "$INIT_C" ] || { echo "ERROR: init.c not found"; exit 1; }
+          KSU_REAL=$(realpath drivers/kernelsu)
+          INIT_C=$(grep -rlE 'int\s+__init\s+(kernelsu_init|ksu_init)\s*\(' "$KSU_REAL" | head -n1)
+          [ -n "$INIT_C" ] || { echo "ERROR: init.c with kernelsu_init/ksu_init not found in $KSU_REAL"; exit 1; }
+          echo "Patching target file: $INIT_C"
+
           python3 - "$INIT_C" <<'PYEOF'
           import re, sys, pathlib
 
           p = pathlib.Path(sys.argv[1])
           text = p.read_text()
-
-          marker = '''
-          static const char __used __attribute__((section(".rodata"))) safe_late_load_marker[] =
-              "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";
-          '''
-          if 'SAFE_LATE_LOAD: skipping' not in text:
-              text = marker + "\n" + text
 
           # Locate the exact function span of kernelsu_init / ksu_init via brace counting
           fn_match = re.search(r'int\s+__init\s+(?:kernelsu_init|ksu_init)\s*\([^)]*\)\s*\{', text)
@@ -187,16 +183,22 @@ jobs:
 
           fn_body = text[open_brace + 1:close_brace]
 
-          # Reference marker at top of init function so .rodata string is retained
+          # Force the marker string into .rodata with __used so Clang cannot DCE it
+          # (previous pr_info-only approach was still stripped in some builds)
           boot_line = "\n\t\tksu_boot_completed = true;" if "ksu_boot_completed" in text else ""
-          fn_body = "\n\t(void)safe_late_load_marker;" + fn_body
-
-          # Insert goto right after the late-load pr_info inside kernelsu_init/ksu_init
-          anchor1_pat = re.compile(r'(pr_info\s*\(\s*[^;]*?"[^"]*late load mode, skipping kprobe hooks\\n"\s*\)\s*;)')
+          marker_def = (
+              '\n\tstatic const char __used safe_late_load_marker[] = '
+              '"SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n";'
+          )
+          anchor1_pat = re.compile(
+              r'(pr_info\s*\(\s*[^;]*?"[^"]*late load mode, skipping kprobe hooks\\n"\s*\)\s*;)'
+          )
           fn_body, n1 = anchor1_pat.subn(
-              r'\1\n\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");'
+              r'\1'
+              + marker_def
+              + '\n\t\tpr_info("%s", safe_late_load_marker);'
               + boot_line
-              + r'\n\t\tgoto safe_late_done;',
+              + '\n\t\tgoto safe_late_done;',
               fn_body,
               count=1
           )
@@ -215,8 +217,12 @@ jobs:
 
           text = text[:open_brace + 1] + fn_body + text[close_brace:]
           p.write_text(text)
-          print("Successfully patched init.c with function-scoped safe_late_done label.")
           PYEOF
+
+          # Fail-fast verification before starting kernel build
+          grep -Fq "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init" "$INIT_C"
+          grep -Fq "safe_late_done:" "$INIT_C"
+
           python3 - << 'PY'
           import re, sys
           def patch(path, pat, repl, desc):
