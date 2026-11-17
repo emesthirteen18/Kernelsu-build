@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 360
     steps:
       - name: Maximize build space
-        uses: easimon/maximize-build-space@fc85e949a71f97bb730188c4575dcfcd311e0605 # v0.0.17
+        uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c # v10
         with:
           root-reserve-mb: 12288
           temp-reserve-mb: 4096
@@ -32,12 +32,12 @@ jobs:
           remove-codeql: 'true'
 
       - name: Checkout user repo (e-r20, spray, stock.ko)
-        uses: actions/checkout@11bd71901bbe5b1630c584be1a3a10a0bfc41a22 # v4.2.2
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: workspace-repo
 
       - name: Checkout Nothing Kernel Source
-        uses: actions/checkout@11bd71901bbe5b1630c584be1a3a10a0bfc41a22 # v4.2.2
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
           ref: 'sm7750/b/FroggerPro'
@@ -574,7 +574,7 @@ jobs:
           cd "$B" && zip -r9 "$GITHUB_WORKSPACE/kernelsu-all-in-one.zip" .
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@b4b4d3bbf8bd89b73390183f62cb5c8f8a1f8d9c # v4.4.3
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: kernelsu-all-in-one
           path: ${{ github.workspace }}/kernelsu-all-in-one.zip
