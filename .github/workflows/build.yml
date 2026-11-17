@@ -84,7 +84,7 @@ jobs:
             BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
               "https://api.github.com/repos/Baka-SU/BakaSU/releases?per_page=1" \
               | jq -r '.[0].tag_name // empty')
-            if [ -z "\( {BAKASU_REF}" ] || [ " \){BAKASU_REF}" = "null" ]; then
+            if [ -z "${BAKASU_REF}" ] || [ "${BAKASU_REF}" = "null" ]; then
               BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
                 "https://api.github.com/repos/Baka-SU/BakaSU/tags?per_page=1" \
                 | jq -r '.[0].name // "main"')
@@ -130,9 +130,19 @@ jobs:
             exit 1
           fi
 
-          # Register Kconfig in drivers/Kconfig so olddefconfig/autoconf.h preserves CONFIG_KSU_DEBUG
-          if [ -f drivers/kernelsu/Kconfig ] && ! grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig; then
-            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          # Register Kconfig in drivers/Kconfig once so olddefconfig/autoconf.h preserves CONFIG_KSU_DEBUG
+          if [ -f drivers/kernelsu/Kconfig ] && ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
+            python3 - << 'PY'
+          import pathlib
+          p = pathlib.Path("drivers/Kconfig")
+          s = p.read_text()
+          idx = s.rfind("endmenu")
+          if idx != -1:
+              s = s[:idx] + 'source "drivers/kernelsu/Kconfig"\n' + s[idx:]
+          else:
+              s += '\nsource "drivers/kernelsu/Kconfig"\n'
+          p.write_text(s)
+          PY
           fi
 
           # Prepend flags so top-to-bottom Kbuild conditionals evaluate with CONFIG_KSU_DEBUG=y
@@ -141,7 +151,7 @@ jobs:
             echo "CONFIG_KSU_DEBUG := y"
             echo "ccflags-y += -DCONFIG_KSU_DEBUG=1 -DCONFIG_KSU_SAFE_LATE_LOAD=1"
             cat "${KBUILD_FILE}"
-          } > "\( {KBUILD_FILE}.tmp" && mv " \){KBUILD_FILE}.tmp" "${KBUILD_FILE}"
+          } > "${KBUILD_FILE}.tmp" && mv "${KBUILD_FILE}.tmp" "${KBUILD_FILE}"
 
           cat << 'EOF' >> arch/arm64/configs/gki_defconfig
           CONFIG_KSU=m
@@ -183,20 +193,15 @@ jobs:
 
           fn_body = text[open_brace + 1:close_brace]
 
-          # Force the marker string into .rodata with __used so Clang cannot DCE it
-          # (previous pr_info-only approach was still stripped in some builds)
+          # Reference the global marker at function entry and at the late-load jump site
           boot_line = "\n\t\tksu_boot_completed = true;" if "ksu_boot_completed" in text else ""
-          marker_def = (
-              '\n\tstatic const char __used safe_late_load_marker[] = '
-              '"SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n";'
-          )
           anchor1_pat = re.compile(
               r'(pr_info\s*\(\s*[^;]*?"[^"]*late load mode, skipping kprobe hooks\\n"\s*\)\s*;)'
           )
           fn_body, n1 = anchor1_pat.subn(
               r'\1'
-              + marker_def
-              + '\n\t\tpr_info("%s", safe_late_load_marker);'
+              + '\n\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");'
+              + '\n\t\tpr_info("%s\\n", safe_late_load_marker);'
               + boot_line
               + '\n\t\tgoto safe_late_done;',
               fn_body,
@@ -210,12 +215,25 @@ jobs:
           last_ret = ret_matches[-1]
           indent = last_ret.group(1)
           fn_body = (
-              fn_body[:last_ret.start()]
+              "\n\t(void)safe_late_load_marker;"
+              + fn_body[:last_ret.start()]
               + f"\nsafe_late_done:\n{indent};"
               + fn_body[last_ret.start():]
           )
 
-          text = text[:open_brace + 1] + fn_body + text[close_brace:]
+          # Place non-static (STB_GLOBAL) .rodata array right before kernelsu_init/ksu_init
+          # (after all #include headers so attributes are defined and Clang/lld -r cannot strip it)
+          global_marker = (
+              '\nconst char __used __attribute__((used, section(".rodata"))) safe_late_load_marker[] = '
+              '"SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";\n\n'
+          )
+          text = (
+              text[:fn_match.start()]
+              + global_marker
+              + text[fn_match.start():open_brace + 1]
+              + fn_body
+              + text[close_brace:]
+          )
           p.write_text(text)
           PYEOF
 
@@ -255,7 +273,7 @@ jobs:
             drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
-          scripts/config --enable CONFIG_MODULES --enable CONFIG_MODULE_UNLOAD
+          scripts/config --enable CONFIG_MODULES --enable CONFIG_MODULE_UNLOAD --enable CONFIG_PRINTK
           scripts/config --disable CONFIG_MODULE_SIG --disable CONFIG_MODULE_SIG_FORCE --disable CONFIG_WERROR
           scripts/config --module CONFIG_KSU
           scripts/config --enable CONFIG_KSU_DEBUG
