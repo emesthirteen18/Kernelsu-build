@@ -84,7 +84,7 @@ jobs:
             BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
               "https://api.github.com/repos/Baka-SU/BakaSU/releases?per_page=1" \
               | jq -r '.[0].tag_name // empty')
-            if [ -z "${BAKASU_REF}" ] || [ "${BAKASU_REF}" = "null" ]; then
+            if [ -z "\( {BAKASU_REF}" ] || [ " \){BAKASU_REF}" = "null" ]; then
               BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
                 "https://api.github.com/repos/Baka-SU/BakaSU/tags?per_page=1" \
                 | jq -r '.[0].name // "main"')
@@ -151,7 +151,7 @@ jobs:
             echo "CONFIG_KSU_DEBUG := y"
             echo "ccflags-y += -DCONFIG_KSU_DEBUG=1 -DCONFIG_KSU_SAFE_LATE_LOAD=1"
             cat "${KBUILD_FILE}"
-          } > "${KBUILD_FILE}.tmp" && mv "${KBUILD_FILE}.tmp" "${KBUILD_FILE}"
+          } > "\( {KBUILD_FILE}.tmp" && mv " \){KBUILD_FILE}.tmp" "${KBUILD_FILE}"
 
           cat << 'EOF' >> arch/arm64/configs/gki_defconfig
           CONFIG_KSU=m
@@ -199,11 +199,13 @@ jobs:
               r'(pr_info\s*\(\s*[^;]*?"[^"]*late load mode, skipping kprobe hooks\\n"\s*\)\s*;)'
           )
           fn_body, n1 = anchor1_pat.subn(
-              r'\1'
-              + '\n\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");'
-              + '\n\t\tpr_info("%s\\n", safe_late_load_marker);'
-              + boot_line
-              + '\n\t\tgoto safe_late_done;',
+              lambda m: (
+                  m.group(1)
+                  + '\n\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");'
+                  + '\n\t\tpr_info("%s\\n", safe_late_load_marker);'
+                  + boot_line
+                  + '\n\t\tgoto safe_late_done;'
+              ),
               fn_body,
               count=1
           )
@@ -234,11 +236,14 @@ jobs:
               + fn_body
               + text[close_brace:]
           )
+          assert 'pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");' in text
+          assert 'pr_info("%s\\n", safe_late_load_marker);' in text
           p.write_text(text)
           PYEOF
 
           # Fail-fast verification before starting kernel build
-          grep -Fq "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init" "$INIT_C"
+          grep -Fq 'pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\n");' "$INIT_C"
+          grep -Fq 'pr_info("%s\n", safe_late_load_marker);' "$INIT_C"
           grep -Fq "safe_late_done:" "$INIT_C"
 
           python3 - << 'PY'
