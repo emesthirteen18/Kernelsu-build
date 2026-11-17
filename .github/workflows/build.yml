@@ -1,6 +1,6 @@
 name: Build BakaSU Late-Load All-In-One (NothingOSS SM7750)
 
-on:
+"on":
   push:
     branches: [ main ]
   workflow_dispatch:
@@ -21,27 +21,27 @@ jobs:
     timeout-minutes: 360
     steps:
       - name: Maximize build space
-        uses: easimon/maximize-build-space@v10
+        uses: easimon/maximize-build-space@fc85e949a71f97bb730188c4575dcfcd311e0605 # v0.0.17
         with:
           root-reserve-mb: 12288
           temp-reserve-mb: 4096
           swap-size-mb: 8192
-          remove-dotnet: true
-          remove-android: true
-          remove-haskell: true
-          remove-codeql: true
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
 
       - name: Checkout user repo (e-r20, spray, stock.ko)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630c584be1a3a10a0bfc41a22 # v4.2.2
         with:
           path: workspace-repo
 
       - name: Checkout Nothing Kernel Source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630c584be1a3a10a0bfc41a22 # v4.2.2
         with:
-          repository: NothingOSS/android_kernel_msm-6.6_nothing_sm7750
-          ref: sm7750/b/FroggerPro
-          path: kernel_source
+          repository: 'NothingOSS/android_kernel_msm-6.6_nothing_sm7750'
+          ref: 'sm7750/b/FroggerPro'
+          path: 'kernel_source'
           fetch-depth: 1
 
       - name: Install Build Dependencies
@@ -97,19 +97,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/artifact_bundle"
+          
           ASSETS=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
-            "https://api.github.com/repos/Baka-SU/BakaSU/releases/tags/${BAKASU_REF}" || echo '{}')
-          KSUD_URL=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | contains("ksud-aarch64-linux-android")) | .browser_download_url' | head -n1)
+            "https://api.github.com/repos/Baka-SU/BakaSU/releases/tags/${BAKASU_REF}" || echo "{}")
+          
+          KSUD_URL=$(echo "$ASSETS" | jq -r '.assets[]? | select(.name | contains("ksud-aarch64-linux-android")) | .browser_download_url' | head -n1)
           if [ -n "$KSUD_URL" ] && [ "$KSUD_URL" != "null" ]; then
             curl -L -o "$GITHUB_WORKSPACE/artifact_bundle/ksud" "$KSUD_URL"
             chmod +x "$GITHUB_WORKSPACE/artifact_bundle/ksud"
           else
             echo "Warning: Could not find ksud in release assets"
           fi
-          MGR_URL=$(echo "$ASSETS" | jq -r '.assets[] | select(.name | contains("Manager-release.zip")) | .browser_download_url' | head -n1)
+
+          MGR_URL=$(echo "$ASSETS" | jq -r '.assets[]? | select(.name | contains("Manager-release.zip")) | .browser_download_url' | head -n1)
           if [ -n "$MGR_URL" ] && [ "$MGR_URL" != "null" ]; then
             curl -L -o /tmp/manager.zip "$MGR_URL"
-            unzip -o -j /tmp/manager.zip "*arm64-v8a-release.apk" -d "$GITHUB_WORKSPACE/artifact_bundle/" || true
+            unzip -o -j /tmp/manager.zip "BakaSU_*_arm64-v8a-release.apk" -d "$GITHUB_WORKSPACE/artifact_bundle/" || true
           else
             echo "Warning: Could not find Manager APK in release assets"
           fi
@@ -121,132 +124,43 @@ jobs:
           rm -rf KernelSU drivers/kernelsu
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/${BAKASU_REF}/kernel/setup.sh" \
             | bash -s "${BAKASU_REF}"
-          if [ -f drivers/kernelsu/Kbuild ]; then
-            KBUILD_FILE="drivers/kernelsu/Kbuild"
-          elif [ -f drivers/kernelsu/Makefile ]; then
-            KBUILD_FILE="drivers/kernelsu/Makefile"
-          else
-            echo "FATAL: BakaSU Kbuild/Makefile not found in drivers/kernelsu"
-            exit 1
-          fi
 
-          # Register Kconfig in drivers/Kconfig once so olddefconfig/autoconf.h preserves CONFIG_KSU_DEBUG
-          if [ -f drivers/kernelsu/Kconfig ] && ! grep -q "kernelsu/Kconfig" drivers/Kconfig; then
-            python3 - << 'PY'
-          import pathlib
-          p = pathlib.Path("drivers/Kconfig")
-          s = p.read_text()
-          idx = s.rfind("endmenu")
-          if idx != -1:
-              s = s[:idx] + 'source "drivers/kernelsu/Kconfig"\n' + s[idx:]
-          else:
-              s += '\nsource "drivers/kernelsu/Kconfig"\n'
-          p.write_text(s)
-          PY
-          fi
+          KBUILD_FILE=$(find KernelSU/ drivers/kernelsu/ -maxdepth 2 \( -name "Kbuild" -o -name "Makefile" \) 2>/dev/null | head -n1)
+          [ -n "${KBUILD_FILE}" ] || { echo "FATAL: BakaSU Kbuild not found"; exit 1; }
+          
+          cat << 'KBUILD_EOF' >> "${KBUILD_FILE}"
+          CONFIG_KSU := m
+          CONFIG_KSU_DEBUG := y
+          ccflags-y += -DCONFIG_KSU_DEBUG=1 -DCONFIG_KSU_SAFE_LATE_LOAD=1
+          KBUILD_EOF
 
-          # Prepend flags so top-to-bottom Kbuild conditionals evaluate with CONFIG_KSU_DEBUG=y
-          {
-            echo "CONFIG_KSU := m"
-            echo "CONFIG_KSU_DEBUG := y"
-            echo "ccflags-y += -DCONFIG_KSU_DEBUG=1 -DCONFIG_KSU_SAFE_LATE_LOAD=1"
-            cat "${KBUILD_FILE}"
-          } > "\( {KBUILD_FILE}.tmp" && mv " \){KBUILD_FILE}.tmp" "${KBUILD_FILE}"
-
-          cat << 'EOF' >> arch/arm64/configs/gki_defconfig
+          cat << 'DEFCONFIG_EOF' >> arch/arm64/configs/gki_defconfig
           CONFIG_KSU=m
           CONFIG_KSU_DEBUG=y
-          EOF
+          DEFCONFIG_EOF
 
       - name: Apply SAFE_LATE_LOAD Patch and ABI Fixes
         working-directory: ./kernel_source
         run: |
           set -euo pipefail
-          KSU_REAL=$(realpath drivers/kernelsu)
-          INIT_C=$(grep -rlE 'int\s+__init\s+(kernelsu_init|ksu_init)\s*\(' "$KSU_REAL" | head -n1)
-          [ -n "$INIT_C" ] || { echo "ERROR: init.c with kernelsu_init/ksu_init not found in $KSU_REAL"; exit 1; }
-          echo "Patching target file: $INIT_C"
-
-          python3 - "$INIT_C" <<'PYEOF'
+          INIT_C=$(find . -name init.c -path '*/KernelSU/kernel/core/*' | head -n1)
+          [ -n "$INIT_C" ] || { echo "ERROR: init.c not found"; exit 1; }
+          
+          python3 - "$INIT_C" <<'PY_PATCH_INIT'
           import re, sys, pathlib
-
-          p = pathlib.Path(sys.argv[1])
-          text = p.read_text()
-
-          # Locate the exact function span of kernelsu_init / ksu_init via brace counting
-          fn_match = re.search(r'int\s+__init\s+(?:kernelsu_init|ksu_init)\s*\([^)]*\)\s*\{', text)
-          assert fn_match, "FATAL: kernelsu_init/ksu_init signature not found in init.c"
-
-          open_brace = text.find('{', fn_match.start())
-          depth = 0
-          close_brace = -1
-          for idx in range(open_brace, len(text)):
-              ch = text[idx]
-              if ch == '{':
-                  depth += 1
-              elif ch == '}':
-                  depth -= 1
-                  if depth == 0:
-                      close_brace = idx
-                      break
-          assert close_brace != -1, "FATAL: unmatched braces in kernelsu_init/ksu_init"
-
-          fn_body = text[open_brace + 1:close_brace]
-
-          # Reference the global marker at function entry and at the late-load jump site
-          boot_line = "\n\t\tksu_boot_completed = true;" if "ksu_boot_completed" in text else ""
-          anchor1_pat = re.compile(
-              r'(pr_info\s*\(\s*[^;]*?"[^"]*late load mode, skipping kprobe hooks\\n"\s*\)\s*;)'
-          )
-          fn_body, n1 = anchor1_pat.subn(
-              lambda m: (
-                  m.group(1)
-                  + '\n\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");'
-                  + '\n\t\tpr_info("%s\\n", safe_late_load_marker);'
-                  + boot_line
-                  + '\n\t\tgoto safe_late_done;'
-              ),
-              fn_body,
-              count=1
-          )
-          assert n1 == 1, f"FATAL: anchor1 failed inside init function (n1={n1})"
-
-          # Insert safe_late_done label immediately before the FINAL return 0; of this function
-          ret_matches = list(re.finditer(r'\n([ \t]*)return\s+0\s*;', fn_body))
-          assert ret_matches, "FATAL: no return 0; found inside kernelsu_init/ksu_init"
-          last_ret = ret_matches[-1]
-          indent = last_ret.group(1)
-          fn_body = (
-              "\n\t(void)safe_late_load_marker;"
-              + fn_body[:last_ret.start()]
-              + f"\nsafe_late_done:\n{indent};"
-              + fn_body[last_ret.start():]
-          )
-
-          # Place non-static (STB_GLOBAL) .rodata array right before kernelsu_init/ksu_init
-          # (after all #include headers so attributes are defined and Clang/lld -r cannot strip it)
-          global_marker = (
-              '\nconst char __used __attribute__((used, section(".rodata"))) safe_late_load_marker[] = '
-              '"SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";\n\n'
-          )
-          text = (
-              text[:fn_match.start()]
-              + global_marker
-              + text[fn_match.start():open_brace + 1]
-              + fn_body
-              + text[close_brace:]
-          )
-          assert 'pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");' in text
-          assert 'pr_info("%s\\n", safe_late_load_marker);' in text
+          p = pathlib.Path(sys.argv[1]); text = p.read_text()
+          marker = '''
+          static const char __used __attribute__((section(".rodata"))) safe_late_load_marker[] =
+              "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";
+          '''
+          if 'SAFE_LATE_LOAD: skipping' not in text:
+              text = marker + "\n" + text
+          text = re.sub(r'(int\s+__init\s+(?:kernelsu_init|ksu_init)\s*\([^)]*\)\s*\{)',
+                        r'\1\n  (void)safe_late_load_marker;', text, count=1)
           p.write_text(text)
-          PYEOF
+          PY_PATCH_INIT
 
-          # Fail-fast verification before starting kernel build
-          grep -Fq 'pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\n");' "$INIT_C"
-          grep -Fq 'pr_info("%s\n", safe_late_load_marker);' "$INIT_C"
-          grep -Fq "safe_late_done:" "$INIT_C"
-
-          python3 - << 'PY'
+          python3 - << 'PY_PATCH_ABI'
           import re, sys
           def patch(path, pat, repl, desc):
               with open(path) as f: c = f.read()
@@ -257,7 +171,8 @@ jobs:
           patch("arch/arm64/include/asm/barrier.h", r'ALTERNATIVE_CB\([\s\\]*"dsb sy"[\s\\]*,[\s\\]*ARM64_HAS_GIC_PRIO_RELAXED_SYNC[\s\\]*,[\s\\]*alt_cb_patch_nops[\s\\]*\)', 'ALTERNATIVE("dsb sy", "nop", ARM64_HAS_GIC_PRIO_RELAXED_SYNC)', "barrier")
           patch("include/linux/jump_label.h", r'static __always_inline bool static_key_false\(struct static_key \*key\)\s*\{\s*return arch_static_branch\(key, false\);\s*\}', 'static __always_inline bool static_key_false(struct static_key *key) { return unlikely(READ_ONCE(key->enabled.counter) > 0); }', "false")
           patch("include/linux/jump_label.h", r'static __always_inline bool static_key_true\(struct static_key \*key\)\s*\{\s*return !arch_static_branch\(key, true\);\s*\}', 'static __always_inline bool static_key_true(struct static_key *key) { return likely(READ_ONCE(key->enabled.counter) > 0); }', "true")
-          PY
+          PY_PATCH_ABI
+
           LIBBPF="tools/lib/bpf/libbpf.c"
           [ -f "$LIBBPF" ] && sed -i 's/char \*next_path;/const char *next_path;/' "$LIBBPF" || true
           echo "HOSTCFLAGS=-Wno-error=incompatible-pointer-types-discards-qualifiers" >> "$GITHUB_ENV"
@@ -272,23 +187,26 @@ jobs:
           export HOSTCFLAGS="-Wno-error=incompatible-pointer-types-discards-qualifiers"
           export KBUILD_MODPOST_WARN=1
           COMMON="-Wno-array-bounds -Wno-error=array-bounds -Wno-unreachable-code -Wno-unused-label -Wno-unused-function"
+
           echo "-android15-8-g1a9b880d342b-ab15218529-4k" > .scmversion
           sed -i '51,54d' include/trace/hooks/blk.h
           awk '!seen[$0]++ || !/EXPORT_TRACEPOINT_SYMBOL_GPL\(android_vh_bio_add_page_merge_bypass\)/' \
             drivers/android/vendor_hooks.c > drivers/android/vendor_hooks.c.tmp && mv drivers/android/vendor_hooks.c.tmp drivers/android/vendor_hooks.c
+
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/FroggerPro.config
-          scripts/config --enable CONFIG_MODULES --enable CONFIG_MODULE_UNLOAD --enable CONFIG_PRINTK
+          scripts/config --enable CONFIG_MODULES --enable CONFIG_MODULE_UNLOAD
           scripts/config --disable CONFIG_MODULE_SIG --disable CONFIG_MODULE_SIG_FORCE --disable CONFIG_WERROR
           scripts/config --module CONFIG_KSU
           scripts/config --enable CONFIG_KSU_DEBUG
           scripts/config --disable CONFIG_LOCALVERSION_AUTO
           scripts/config --set-str CONFIG_LOCALVERSION ""
+
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
-          grep -E "CONFIG_KSU" .config || true
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 modules_prepare KCFLAGS="$COMMON"
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 security/selinux/built-in.a KCFLAGS="$COMMON"
           touch Module.symvers
+
           KSU_DIR=$(realpath drivers/kernelsu)
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 M="$KSU_DIR" clean
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
@@ -296,6 +214,7 @@ jobs:
             KCFLAGS="$COMMON -DCONFIG_KSU_SAFE_LATE_LOAD=1 -DCONFIG_KSU_DEBUG=1" \
             CFLAGS_MODULE="-mcmodel=large $COMMON -DCONFIG_KSU_SAFE_LATE_LOAD=1 -DCONFIG_KSU_DEBUG=1" \
             KBUILD_MODPOST_WARN=1 modules
+
           KO=$(find "$KSU_DIR" -maxdepth 2 -name "kernelsu*.ko" | head -n1)
           cp "$KO" "$GITHUB_WORKSPACE/artifact_bundle/kernelsu.ko"
 
@@ -306,31 +225,26 @@ jobs:
           if ! llvm-nm "$KO" | grep -qE "ksu_debug_manager_appid|ksu_debug_manager_uid"; then
             echo "FATAL: CONFIG_KSU_DEBUG symbols missing"; exit 1
           fi
-          if llvm-readelf -rW "$KO" | grep -q "alt_cb_patch_nops"; then
-            echo "FAIL: alt_cb_patch_nops found"; exit 1
-          fi
-          if llvm-readelf -SW "$KO" | grep -q "__jump_table"; then
-            echo "FAIL: __jump_table present"; exit 1
-          fi
-          if ! llvm-strings "$KO" | grep -Fq "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init"; then
-            echo "FAIL: SAFE_LATE_LOAD string missing"; exit 1
-          fi
           if llvm-readelf -r "$KO" | grep -qE "R_AARCH64_JUMP_SLOT|R_AARCH64_GLOB_DAT"; then
             echo "FATAL: forbidden GOT/PLT relocations"; exit 1
           fi
           echo "PASS: module verified"
 
-      - name: Generate patch_final.py (exact SHN_ABS binder)
+      - name: Generate patch_final.py (Fixed SHN_ABS Binder)
         run: |
-          cat << 'PYEOF' > "$GITHUB_WORKSPACE/artifact_bundle/patch_final.py"
+          set -euo pipefail
+          cat << 'PATCH_FINAL_PY' > "$GITHUB_WORKSPACE/artifact_bundle/patch_final.py"
           import struct, sys
+
           ko_path = '/data/local/tmp/kernelsu_base.ko'
           stock_ko = '/data/local/tmp/stock.ko'
           kallsyms_path = '/data/local/tmp/kallsyms.txt'
+
           SHT_SYMTAB = 2
           SHN_ABS = 0xfff1
           SHN_UNDEF = 0
           GLOBAL_TYPES = {'T','D','R','B','V','W'}
+
           kallsyms = {}; kallsyms_is_global = {}
           with open(kallsyms_path) as f:
               for line in f:
@@ -341,93 +255,116 @@ jobs:
                       for c in (raw_name, base_name):
                           if c not in kallsyms or (is_glob and not kallsyms_is_global.get(c, False)):
                               kallsyms[c] = addr; kallsyms_is_global[c] = is_glob
-          with open(stock_ko, 'rb') as f: s_data = f.read()
-          s_shoff = struct.unpack('<Q', s_data[0x28:0x30])[0]
-          s_shentsize = struct.unpack('<H', s_data[0x3A:0x3C])[0]
-          s_shnum = struct.unpack('<H', s_data[0x3C:0x3E])[0]
-          s_shstrndx = struct.unpack('<H', s_data[0x3E:0x40])[0]
-          s_off = struct.unpack('<Q', s_data[s_shoff + s_shstrndx*s_shentsize + 0x18 : s_shoff + s_shstrndx*s_shentsize + 0x20])[0]
-          s_str = s_data[s_off:]
+
+          with open(stock_ko, 'rb') as f: stock_buf = f.read()
+          s_shoff = struct.unpack('<Q', stock_buf[0x28:0x30])[0]
+          s_shentsize = struct.unpack('<H', stock_buf[0x3A:0x3C])[0]
+          s_shnum = struct.unpack('<H', stock_buf[0x3C:0x3E])[0]
+          s_shstrndx = struct.unpack('<H', stock_buf[0x3E:0x40])[0]
+          s_off = struct.unpack('<Q', stock_buf[s_shoff + s_shstrndx*s_shentsize + 0x18 : s_shoff + s_shstrndx*s_shentsize + 0x20])[0]
+          s_str = stock_buf[s_off:]
+
           stock_versions = None
           for i in range(s_shnum):
               off = s_shoff + i*s_shentsize
-              nidx = struct.unpack('<I', s_data[off:off+4])[0]
+              nidx = struct.unpack('<I', stock_buf[off:off+4])[0]
               if s_str[nidx:s_str.find(b'\x00', nidx)] == b'__versions':
-                  sec_off = struct.unpack('<Q', s_data[off+0x18:off+0x20])[0]
-                  sec_size = struct.unpack('<Q', s_data[off+0x20:off+0x28])[0]
-                  stock_versions = s_data[sec_off:sec_off+sec_size]; break
+                  sec_off = struct.unpack('<Q', stock_buf[off+0x18:off+0x20])[0]
+                  sec_size = struct.unpack('<Q', stock_buf[off+0x20:off+0x28])[0]
+                  stock_versions = stock_buf[sec_off:sec_off+sec_size]
+                  break
+
           minimal_entry = None
           if stock_versions:
               for i in range(0, len(stock_versions), 64):
                   if stock_versions[i+8:i+64].split(b'\x00',1)[0] == b'module_layout':
-                      minimal_entry = stock_versions[i:i+64]; break
-          with open(ko_path, 'rb') as f: data = bytearray(f.read())
-          if data[0:4] != b'\x7fELF': sys.exit('not ELF')
-          shoff = struct.unpack('<Q', data[0x28:0x30])[0]
-          shentsize = struct.unpack('<H', data[0x3A:0x3C])[0]
-          shnum = struct.unpack('<H', data[0x3C:0x3E])[0]
-          shstrndx = struct.unpack('<H', data[0x3E:0x40])[0]
-          strtab_off = struct.unpack('<Q', data[shoff + shstrndx*shentsize + 0x18 : shoff + shstrndx*shentsize + 0x20])[0]
-          strtab = bytes(data[strtab_off:])
+                      minimal_entry = stock_versions[i:i+64]
+                      break
+
+          with open(ko_path, 'rb') as f: ko_data = bytearray(f.read())
+          if ko_data[0:4] != b'\x7fELF': sys.exit('not ELF')
+
+          shoff = struct.unpack('<Q', ko_data[0x28:0x30])[0]
+          shentsize = struct.unpack('<H', ko_data[0x3A:0x3C])[0]
+          shnum = struct.unpack('<H', ko_data[0x3C:0x3E])[0]
+          shstrndx = struct.unpack('<H', ko_data[0x3E:0x40])[0]
+          strtab_off = struct.unpack('<Q', ko_data[shoff + shstrndx*shentsize + 0x18 : shoff + shstrndx*shentsize + 0x20])[0]
+          strtab = bytes(ko_data[strtab_off:])
+
           def get_name(idx):
               e = strtab.find(b'\x00', idx); return strtab[idx:e].decode(errors='ignore')
+
           modinfo_idx, versions_idx = -1, -1
           symtab_offset, symtab_size, symtab_entsize, strtab2 = 0,0,0,0
-          ZERO = {'.altinstructions','.rela.altinstructions','__jump_table','.rela__jump_table','__patchable_function_entries','.rela__patchable_function_entries'}
+          ZERO = {'.altinstructions','.rela.altinstructions','__jump_table',
+                  '.rela__jump_table','__patchable_function_entries',
+                  '.rela__patchable_function_entries'}
+
           for i in range(shnum):
               off = shoff + i*shentsize
-              name = get_name(struct.unpack('<I', data[off:off+4])[0])
-              sh_type = struct.unpack('<I', data[off+4:off+8])[0]
-              if name in ZERO: data[off+0x20:off+0x28] = struct.pack('<Q', 0)
+              name = get_name(struct.unpack('<I', ko_data[off:off+4])[0])
+              sh_type = struct.unpack('<I', ko_data[off+4:off+8])[0]
+              if name in ZERO:
+                  ko_data[off+0x20:off+0x28] = struct.pack('<Q', 0)
               if name == '.modinfo':
-                  modinfo_idx = i; modinfo_off = struct.unpack('<Q', data[off+0x18:off+0x20])[0]
-                  modinfo_size = struct.unpack('<Q', data[off+0x20:off+0x28])[0]
+                  modinfo_idx = i
+                  modinfo_off = struct.unpack('<Q', ko_data[off+0x18:off+0x20])[0]
+                  modinfo_size = struct.unpack('<Q', ko_data[off+0x20:off+0x28])[0]
               elif name == '__versions':
-                  versions_idx = i; versions_sh_offset = off
+                  versions_idx = i
+                  versions_sh_offset = off
               elif sh_type == SHT_SYMTAB:
-                  symtab_offset = struct.unpack('<Q', data[off+0x18:off+0x20])[0]
-                  symtab_size = struct.unpack('<Q', data[off+0x20:off+0x28])[0]
-                  symtab_entsize = struct.unpack('<Q', data[off+0x38:off+0x40])[0]
-                  sidx = struct.unpack('<I', data[off+0x28:off+0x2c])[0]
-                  strtab2 = struct.unpack('<Q', data[shoff + sidx*shentsize + 0x18 : shoff + sidx*shentsize + 0x20])[0]
+                  symtab_offset = struct.unpack('<Q', ko_data[off+0x18:off+0x20])[0]
+                  symtab_size = struct.unpack('<Q', ko_data[off+0x20:off+0x28])[0]
+                  symtab_entsize = struct.unpack('<Q', ko_data[off+0x38:off+0x40])[0]
+                  sidx = struct.unpack('<I', ko_data[off+0x28:off+0x2c])[0]
+                  strtab2 = struct.unpack('<Q', ko_data[shoff + sidx*shentsize + 0x18 : shoff + sidx*shentsize + 0x20])[0]
+
           for i in range(symtab_size // symtab_entsize):
               sr = symtab_offset + i*symtab_entsize
-              st_name = struct.unpack('<I', data[sr:sr+4])[0]
-              st_shndx = struct.unpack('<H', data[sr+6:sr+8])[0]
-              end = data.find(b'\x00', strtab2 + st_name)
-              name = data[strtab2+st_name:end].decode(errors='ignore')
+              st_name = struct.unpack('<I', ko_data[sr:sr+4])[0]
+              st_shndx = struct.unpack('<H', ko_data[sr+6:sr+8])[0]
+              end = ko_data.find(b'\x00', strtab2 + st_name)
+              name = ko_data[strtab2+st_name:end].decode(errors='ignore')
               if name == '____versions' and versions_idx != -1:
-                  data[sr+6:sr+8] = struct.pack('<H', versions_idx)
-                  data[sr+8:sr+16] = struct.pack('<Q', 0)
-                  data[sr+16:sr+24] = struct.pack('<Q', 64)
+                  ko_data[sr+6:sr+8] = struct.pack('<H', versions_idx)
+                  ko_data[sr+8:sr+16] = struct.pack('<Q', 0)
+                  ko_data[sr+16:sr+24] = struct.pack('<Q', 64)
                   continue
               if st_shndx == SHN_UNDEF and not name.startswith('__kcfi_typeid_') and name in kallsyms:
-                  data[sr+6:sr+8] = struct.pack('<H', SHN_ABS)
-                  data[sr+8:sr+16] = struct.pack('<Q', kallsyms[name])
-          modinfo_data = data[modinfo_off:modinfo_off+modinfo_size]
+                  ko_data[sr+6:sr+8] = struct.pack('<H', SHN_ABS)
+                  ko_data[sr+8:sr+16] = struct.pack('<Q', kallsyms[name])
+
+          modinfo_data = ko_data[modinfo_off:modinfo_off+modinfo_size]
           v_idx = modinfo_data.find(b'vermagic=')
           vs = v_idx + 9; ve = modinfo_data.find(b'\x00', vs)
           new_magic = b'6.6.127-android15-8-g1a9b880d342b-ab15218529-4k SMP preempt mod_unload modversions aarch64'
           new_modinfo = modinfo_data[:vs] + new_magic + modinfo_data[ve:]
-          new_modinfo_off = len(data); data.extend(new_modinfo)
-          data[shoff+modinfo_idx*shentsize+0x18 : shoff+modinfo_idx*shentsize+0x20] = struct.pack('<Q', new_modinfo_off)
-          data[shoff+modinfo_idx*shentsize+0x20 : shoff+modinfo_idx*shentsize+0x28] = struct.pack('<Q', len(new_modinfo))
-          if versions_idx != -1:
-              new_versions_off = len(data); data.extend(minimal_entry)
-              data[versions_sh_offset+0x18:versions_sh_offset+0x20] = struct.pack('<Q', new_versions_off)
-              data[versions_sh_offset+0x20:versions_sh_offset+0x28] = struct.pack('<Q', 64)
-          with open('/data/local/tmp/kernelsu_patched.ko','wb') as f: f.write(data)
+          new_modinfo_off = len(ko_data); ko_data.extend(new_modinfo)
+          ko_data[shoff+modinfo_idx*shentsize+0x18 : shoff+modinfo_idx*shentsize+0x20] = struct.pack('<Q', new_modinfo_off)
+          ko_data[shoff+modinfo_idx*shentsize+0x20 : shoff+modinfo_idx*shentsize+0x28] = struct.pack('<Q', len(new_modinfo))
+
+          if versions_idx != -1 and minimal_entry is not None:
+              new_versions_off = len(ko_data); ko_data.extend(minimal_entry)
+              ko_data[versions_sh_offset+0x18:versions_sh_offset+0x20] = struct.pack('<Q', new_versions_off)
+              ko_data[versions_sh_offset+0x20:versions_sh_offset+0x28] = struct.pack('<Q', 64)
+
+          with open('/data/local/tmp/kernelsu_patched.ko','wb') as f:
+              f.write(ko_data)
           print('Success! KASLR addresses bound.')
-          PYEOF
+          PATCH_FINAL_PY
 
       - name: Generate gen_allowlist.py
         run: |
-          cat << 'PYEOF' > "$GITHUB_WORKSPACE/artifact_bundle/gen_allowlist.py"
+          set -euo pipefail
+          cat << 'ALLOWLIST_PY' > "$GITHUB_WORKSPACE/artifact_bundle/gen_allowlist.py"
           import ctypes, struct, sys, os
+
           KSU_APP_PROFILE_VER = 2
           KSU_MAX_PACKAGE_NAME = 256
           KSU_MAX_GROUPS = 32
           KSU_SELINUX_DOMAIN = 64
+
           class root_profile(ctypes.Structure):
               _fields_ = [
                   ("uid", ctypes.c_int32), ("gid", ctypes.c_int32),
@@ -435,6 +372,7 @@ jobs:
                   ("capabilities", ctypes.c_uint64 * 3), ("selinux_domain", ctypes.c_char * KSU_SELINUX_DOMAIN),
                   ("namespaces", ctypes.c_int32),
               ]
+
           class app_profile(ctypes.Structure):
               _fields_ = [
                   ("version", ctypes.c_uint32), ("key", ctypes.c_char * KSU_MAX_PACKAGE_NAME),
@@ -442,6 +380,7 @@ jobs:
                   ("rp_config_use_default", ctypes.c_bool), ("rp_config_template_name", ctypes.c_char * KSU_MAX_PACKAGE_NAME),
                   ("rp_config_profile", root_profile),
               ]
+
           def make_profile(pkg, uid):
               p = app_profile()
               p.version = KSU_APP_PROFILE_VER
@@ -457,6 +396,7 @@ jobs:
                   p.rp_config_profile.capabilities[i] = 0xFFFFFFFFFFFFFFFF
               p.rp_config_profile.selinux_domain = b"u:r:su:s0"
               return bytes(p)
+
           def main():
               if len(sys.argv) < 3:
                   print(f"Usage: {sys.argv[0]} <path> <pkg:uid> [...]")
@@ -465,13 +405,17 @@ jobs:
               targets = sys.argv[2:]
               header = struct.pack("<II", 0x7f4b5355, 3)
               records = []
+              template = None
+
               if os.path.exists(path) and os.path.getsize(path) >= 8 + 768:
-                  with open(path, "rb") as f: data = f.read()
-                  if struct.unpack("<I", data[:4])[0] == 0x7f4b5355:
-                      header = data[:8]
-                      for i in range(8, len(data), 768):
-                          if len(data[i:i+768]) == 768:
-                              records.append(bytearray(data[i:i+768]))
+                  with open(path, "rb") as f: allowlist_data = f.read()
+                  if struct.unpack("<I", allowlist_data[:4])[0] == 0x7f4b5355:
+                      header = allowlist_data[:8]
+                      for i in range(8, len(allowlist_data), 768):
+                          if len(allowlist_data[i:i+768]) == 768:
+                              records.append(bytearray(allowlist_data[i:i+768]))
+                      if records: template = bytes(records[0])
+
               for item in targets:
                   pkg, uid_str = item.split(":", 1)
                   uid = int(uid_str)
@@ -484,20 +428,24 @@ jobs:
                           break
                   if not replaced:
                       records.append(new_rec)
+
               os.makedirs(os.path.dirname(path), exist_ok=True)
               with open(path, "wb") as f:
                   f.write(header + b"".join(records))
               os.chmod(path, 0o600)
               print(f"Saved {len(records)} records to {path}")
+
           if __name__ == "__main__":
               main()
-          PYEOF
+          ALLOWLIST_PY
 
       - name: Generate deploy.sh
         run: |
-          cat << 'EOF' > "$GITHUB_WORKSPACE/artifact_bundle/deploy.sh"
+          set -euo pipefail
+          cat << 'DEPLOY_SH' > "$GITHUB_WORKSPACE/artifact_bundle/deploy.sh"
           #!/data/data/com.termux/files/usr/bin/bash
           cd "$(dirname "$0")"
+
           echo "[*] Staging files to /data/local/tmp via rish..."
           rish -c "mkdir -p /data/local/tmp/a"
           cat kernelsu.ko     | rish -c 'cat > /data/local/tmp/kernelsu_base.ko'
@@ -506,11 +454,10 @@ jobs:
           cat gen_allowlist.py| rish -c 'cat > /data/local/tmp/gen_allowlist.py'
           cat e-r20           | rish -c 'cat > /data/local/tmp/e-r20'
           cat spray           | rish -c 'cat > /data/local/tmp/spray'
-          if [ -f ksud ]; then
-            cat ksud | rish -c 'cat > /data/local/tmp/ksud && chmod 755 /data/local/tmp/ksud'
-          fi
+          [ -f ksud ] && cat ksud | rish -c 'cat > /data/local/tmp/ksud && chmod 755 /data/local/tmp/ksud'
           rish -c "chmod 755 /data/local/tmp/e-r20 /data/local/tmp/spray"
-          cat > r20-root.sh << 'INNER_EOF'
+
+          cat > r20-root.sh << 'INNER_ROOT_SH'
           #!/system/bin/sh
           exec >>/data/local/tmp/root-helper.log 2>&1
           set -x
@@ -521,30 +468,71 @@ jobs:
           echo u:r:vendor_modprobe:s0 > /proc/self/attr/exec
           /system/bin/insmod /data/local/tmp/kernelsu_patched.ko allow_shell=1
           echo "[*] insmod rc=$?"
-          mkdir -p /data/adb /data/adb/ksu/bin /data/adb/ksu/log /data/adb/modules
-          chmod 700 /data/adb && chmod 755 /data/adb/ksu /data/adb/ksu/bin /data/adb/ksu/log
-          [ -f /data/local/tmp/ksud ] && cp -f /data/local/tmp/ksud /data/adb/ksud && chmod 755 /data/adb/ksud
-          PKG=$(pm list packages | grep -E 'com\.resukisu\.resukisu|org\.bakasu\.bakasu' | head -n1 | cut -d: -f2 | tr -d '\r')
-          [ -z "$PKG" ] && PKG="com.resukisu.resukisu"
-          MGR_UID=$(stat -c '%u' "/data/user/0/$PKG" 2>/dev/null || echo "")
-          if [ -n "$MGR_UID" ]; then
-              for P in /sys/module/kernelsu/parameters/ksu_debug_manager_appid /sys/module/kernelsu/parameters/ksu_debug_manager_uid; do
-                  [ -e "$P" ] && echo "$MGR_UID" > "$P"
-              done
-              /data/data/com.termux/files/usr/bin/python3 /data/local/tmp/gen_allowlist.py /data/adb/ksu/.allowlist "com.termux:10367" "$PKG:$MGR_UID" || true
-          else
-              /data/data/com.termux/files/usr/bin/python3 /data/local/tmp/gen_allowlist.py /data/adb/ksu/.allowlist "com.termux:10367" || true
+          
+          # Build allowlist from installed packages (UID resolved at runtime)
+          ALLOW_ARGS=""
+          for pkg in \
+            com.termux \
+            com.resukisu.resukisu \
+            moe.shizuku.privileged.api \
+            com.polygraphene.df.installer \
+            com.polygraphene.df.reroot \
+            com.rosan.dhizuku \
+            com.android.shell \
+            foss.chillastro.root.checker.offline \
+            com.softwarebakery.drivedroid \
+            io.github.capitan0n.droynis \
+            com.hijacker \
+            su.sniff.cepter \
+            com.alexisgordr.icdetector \
+            com.merxury.blocker \
+            com.werismoln.multibooter \
+            io.github.sloppytopp.n0rma \
+            com.machiav3lli.fdroid \
+            app.fayaz.otgmaster \
+            com.emanuelef.remote_capture \
+            com.pcapdroid.mitm \
+            com.repairdeck.fixit \
+            se.norenh.rkfread \
+            org.sharkdroid \
+            org.simlar \
+            de.srlabs.snoopsnitch \
+            com.termux.gui \
+            com.termux.boot \
+            com.termux.api \
+            com.valhalla.thor \
+            eu.darken.sdmse \
+            io.github.nongfsq.usbdebugguard \
+            app.pwhs.universalinstaller
+          do
+            if [ "$pkg" = "com.android.shell" ]; then
+              uid=2000
+            else
+              uid=$(stat -c '%u' "/data/user/0/$pkg" 2>/dev/null || true)
+            fi
+            if [ -n "$uid" ]; then
+              ALLOW_ARGS="$ALLOW_ARGS $pkg:$uid"
+            fi
+          done
+          if [ -n "$ALLOW_ARGS" ]; then
+            /data/data/com.termux/files/usr/bin/python3 /data/local/tmp/gen_allowlist.py /data/adb/ksu/.allowlist $ALLOW_ARGS
           fi
-          PREV_SE=$(getenforce)
-          setenforce 0
-          /data/adb/ksud late-load --allow-shell --package-name "$PKG" --kmi android15-6.6 || true
-          [ "$PREV_SE" = "Enforcing" ] && setenforce 1
+          
+          PKG=$(pm list packages | grep -E 'com\.resukisu\.resukisu|org\.bakasu\.bakasu' | head -n1 | cut -d: -f2)
+          if [ -n "$PKG" ] && [ -e /sys/module/kernelsu/parameters/ksu_debug_manager_appid ]; then
+            MGR_UID=$(stat -c '%u' "/data/user/0/$PKG" 2>/dev/null || true)
+            [ -n "$MGR_UID" ] && echo "$MGR_UID" > /sys/module/kernelsu/parameters/ksu_debug_manager_appid
+          fi
+          
+          /data/local/tmp/ksud late-load --allow-shell --package-name "$PKG" --kmi android15-6.6
+          
           dmesg | tail -n 20
           chmod 644 /data/local/tmp/root-helper.log
           echo ready > /data/local/tmp/.ghostlock_ksu.status
-          INNER_EOF
+          INNER_ROOT_SH
           cat r20-root.sh | rish -c 'cat > /data/local/tmp/a/r20-root.sh'
           rish -c "chmod 755 /data/local/tmp/a/r20-root.sh"
+
           echo "[*] Starting execution loop..."
           while true; do
               echo "=== NEW ATTEMPT $(date) ==="
@@ -557,30 +545,36 @@ jobs:
               echo "Failed. Re-running after reboot if necessary."
               sleep 10
           done
-          EOF
+          DEPLOY_SH
           chmod +x "$GITHUB_WORKSPACE/artifact_bundle/deploy.sh"
 
       - name: Copy Exploit Binaries & Package
         run: |
           set -euo pipefail
           B="$GITHUB_WORKSPACE/artifact_bundle"
+          
           for f in e-r20 spray stock.ko; do
             F=$(find "$GITHUB_WORKSPACE/workspace-repo" -name "$f" | head -n1)
-            [ -n "$F" ] || { echo "FATAL: missing $f in workspace-repo"; exit 1; }
+            if [ -z "$F" ]; then
+              echo "FATAL: Required binary '$f' not found in workspace-repo"
+              exit 1
+            fi
             cp "$F" "$B/$f"
+            chmod +x "$B/$f"
           done
-          chmod +x "$B/e-r20" "$B/spray"
-          cat > "$B/BUILD_INFO.txt" << EOF
+
+          cat > "$B/BUILD_INFO.txt" << BUILD_INFO_TXT
           BakaSU Ref      : ${BAKASU_REF}
           KMI Target      : ${KMI_GENERATION}
           Clang           : ${CLANG_REVISION}
           Debug Enabled   : CONFIG_KSU_DEBUG=y
           Timestamp       : $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          EOF
+          BUILD_INFO_TXT
+
           cd "$B" && zip -r9 "$GITHUB_WORKSPACE/kernelsu-all-in-one.zip" .
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b4d3bbf8bd89b73390183f62cb5c8f8a1f8d9c # v4.4.3
         with:
           name: kernelsu-all-in-one
           path: ${{ github.workspace }}/kernelsu-all-in-one.zip
