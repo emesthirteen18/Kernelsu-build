@@ -148,17 +148,88 @@ jobs:
           
           python3 - "$INIT_C" <<'PY_PATCH_INIT'
           import re, sys, pathlib
-          p = pathlib.Path(sys.argv[1]); text = p.read_text()
-          marker = '''
-          static const char __used __attribute__((section(".rodata"))) safe_late_load_marker[] =
-              "SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";
-          '''
-          if 'SAFE_LATE_LOAD: skipping' not in text:
-              text = marker + "\n" + text
-          text = re.sub(r'(int\s+__init\s+(?:kernelsu_init|ksu_init)\s*\([^)]*\)\s*\{)',
-                        r'\1\n  (void)safe_late_load_marker;', text, count=1)
+
+          p = pathlib.Path(sys.argv[1])
+          text = p.read_text()
+
+          # Locate the exact function span of kernelsu_init / ksu_init via brace counting
+          fn_match = re.search(r'int\s+__init\s+(?:kernelsu_init|ksu_init)\s*\([^)]*\)\s*\{', text)
+          assert fn_match, "FATAL: kernelsu_init/ksu_init signature not found in init.c"
+
+          open_brace = text.find('{', fn_match.start())
+          depth = 0
+          close_brace = -1
+          for idx in range(open_brace, len(text)):
+              ch = text[idx]
+              if ch == '{':
+                  depth += 1
+              elif ch == '}':
+                  depth -= 1
+                  if depth == 0:
+                      close_brace = idx
+                      break
+          assert close_brace != -1, "FATAL: unmatched braces in kernelsu_init/ksu_init"
+
+          fn_body = text[open_brace + 1:close_brace]
+
+          # Jump past rules/cred/escape/hook/setenforce after the late-load kprobe skip.
+          # safe_late_done does not exist in BakaSU v4.2.0-rc3 init.c; it is inserted below.
+          boot_line = "\n\t\tksu_boot_completed = true;" if "ksu_boot_completed" in text else ""
+          anchor1_pat = re.compile(
+              r'(pr_info\s*\(\s*[^;]*?"[^"]*late load mode, skipping kprobe hooks\\n"\s*\)\s*;)'
+          )
+          fn_body, n1 = anchor1_pat.subn(
+              lambda m: (
+                  m.group(1)
+                  + '\n\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");'
+                  + '\n\t\tpr_info("%s\\n", safe_late_load_marker);'
+                  + boot_line
+                  + '\n\t\tgoto safe_late_done;'
+              ),
+              fn_body,
+              count=1
+          )
+          assert n1 == 1, f"FATAL: anchor1 failed inside init function (n1={n1})"
+
+          # Insert safe_late_done immediately before the FINAL return 0; of this function
+          ret_matches = list(re.finditer(r'\n([ \t]*)return\s+0\s*;', fn_body))
+          assert ret_matches, "FATAL: no return 0; found inside kernelsu_init/ksu_init"
+          last_ret = ret_matches[-1]
+          indent = last_ret.group(1)
+          fn_body = (
+              "\n\t(void)safe_late_load_marker;"
+              + fn_body[:last_ret.start()]
+              + f"\nsafe_late_done:\n{indent};"
+              + fn_body[last_ret.start():]
+          )
+
+          global_marker = (
+              '\nconst char __used __attribute__((used, section(".rodata"))) safe_late_load_marker[] = '
+              '"SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";\n\n'
+          )
+          text = (
+              text[:fn_match.start()]
+              + global_marker
+              + text[fn_match.start():open_brace + 1]
+              + fn_body
+              + text[close_brace:]
+          )
+          assert 'goto safe_late_done;' in text, "FATAL: goto safe_late_done; missing after patch"
+          assert 'pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");' in text
           p.write_text(text)
           PY_PATCH_INIT
+
+          # Fail-fast: the skip must be a real jump, not just a marker string
+          if ! grep -Fq 'goto safe_late_done;' "$INIT_C"; then
+            echo "FATAL: SAFE_LATE_LOAD regression: init.c is missing 'goto safe_late_done;'"
+            exit 1
+          fi
+          if ! grep -Fq "safe_late_done:" "$INIT_C"; then
+            echo "FATAL: SAFE_LATE_LOAD regression: init.c is missing label safe_late_done:"
+            exit 1
+          fi
+          echo "PASS: SAFE_LATE_LOAD skip is present (goto safe_late_done;)"
+
 
           python3 - << 'PY_PATCH_ABI'
           import re, sys
