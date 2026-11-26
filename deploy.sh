@@ -1,5 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 cd "$(dirname "$0")"
+# Termux rish needs this or staging fails with "RISH_APPLICATION_ID is not set"
+export RISH_APPLICATION_ID="${RISH_APPLICATION_ID:-com.termux}"
 
 echo "[*] Staging files to /data/local/tmp via rish..."
 rish -c "mkdir -p /data/local/tmp/a"
@@ -10,59 +12,17 @@ cat gen_allowlist.py| rish -c 'cat > /data/local/tmp/gen_allowlist.py'
 cat e-r20           | rish -c 'cat > /data/local/tmp/e-r20'
 cat spray           | rish -c 'cat > /data/local/tmp/spray'
 [ -f ksud ] && cat ksud | rish -c 'cat > /data/local/tmp/ksud && chmod 755 /data/local/tmp/ksud'
+# [BOX-PATCH] Stage net-recover/net-watchdog (upstream BLOCK A + helper reference these
+# at /data/local/tmp but never stage them). Logging/recovery only; no insmod-order change.
+[ -f net-recover.sh ]  && cat net-recover.sh  | rish -c 'cat > /data/local/tmp/net-recover.sh && chmod 755 /data/local/tmp/net-recover.sh'
+[ -f net-watchdog.sh ] && cat net-watchdog.sh | rish -c 'cat > /data/local/tmp/net-watchdog.sh && chmod 755 /data/local/tmp/net-watchdog.sh'
 rish -c "chmod 755 /data/local/tmp/e-r20 /data/local/tmp/spray"
 
-cat > r20-root.sh << 'INNER_ROOT_SH'
+# [BOX-PATCH] Pre-compute ALLOW_ARGS / PKG / MGR_UID via rish BEFORE insmod.
+# After insmod the kernel-domain helper has been observed to lose /system/bin/stat
+# and pm, which dropped Termux and ReSukiSU from the allowlist and late-load args.
+cat << 'PRECOMPUTE_SH' | rish -c 'cat > /data/local/tmp/ksu-precompute.sh && chmod 755 /data/local/tmp/ksu-precompute.sh && sh /data/local/tmp/ksu-precompute.sh'
 #!/system/bin/sh
-exec >>/data/local/tmp/root-helper.log 2>&1
-set -x
-id
-echo 0 > /proc/sys/kernel/kptr_restrict
-cat /proc/kallsyms > /data/local/tmp/kallsyms.txt
-/data/data/com.termux/files/usr/bin/python3 /data/local/tmp/patch_final.py
-LOG=/data/local/tmp/net-qa.log
-exec >>"$LOG" 2>&1
-(
-        # Isolate transition+insmod so parent exec_sid is never set
-/system/bin/rm -f /data/local/tmp/net-qa.log /data/local/tmp/.ghostlock_ksu.status 2>/dev/null || true
-# --- BEGIN PRE-EXIT BLOCK B ---
-timeout 2 /system/bin/chmod 0755 /data/local/tmp/net-recover.sh /data/local/tmp/net-watchdog.sh 2>/dev/null || true
-timeout 2 /system/bin/rm -f /data/local/tmp/net-recover.log 2>/dev/null || true
-echo "" > /proc/self/attr/exec 2>/dev/null || true
-# --- END PRE-EXIT BLOCK B ---
-LOG=/data/local/tmp/net-qa.log
-exec >>"$LOG" 2>&1
-/system/bin/sh -c '
-    echo u:r:vendor_modprobe:s0 > /proc/self/attr/exec
-    exec /system/bin/insmod /data/local/tmp/kernelsu_patched.ko allow_shell=1
-'
-rc=$?
-echo "" > /proc/self/attr/exec 2>/dev/null || true
-echo "[*] insmod rc=$rc"
-[ "$rc" -eq 0 ] || exit "$rc"
-)
-rc=$?
-echo "[*] insmod rc=$rc"
-[ "$rc" -eq 0 ] || exit "$rc"
-echo "=== POST-INSMOD $(date) ==="
-echo "uid=\( (id -u) context= \)(cat /proc/self/attr/current 2>/dev/null)"
-for p in netd wpa_supplicant rild qcrild; do echo -n "$p:"; pidof $p || echo MISSING; done
-timeout 5 dmesg | tail -n 100 || true
-timeout 5 ip link show || true
-timeout 5 ip addr show || true
-timeout 5 getprop | grep -E 'net\.|dns|ril|init' || true
-# Recovery
-sleep 1
-timeout 5 svc wifi disable; sleep 1; timeout 5 svc wifi enable || true
-timeout 5 svc data disable; sleep 1; timeout 5 svc data enable || true
-echo "=== END ==="
-
-# Hang-resistant network recovery
-sleep 1
-timeout 5 svc wifi disable; sleep 1; timeout 5 svc wifi enable || true
-timeout 5 svc data disable; sleep 1; timeout 5 svc data enable || true
-
-# Build allowlist from installed packages (UID resolved at runtime)
 ALLOW_ARGS=""
 for pkg in \
   com.termux \
@@ -102,20 +62,146 @@ do
     uid=2000
   else
     uid=$(stat -c '%u' "/data/user/0/$pkg" 2>/dev/null || true)
+    if [ -z "$uid" ]; then
+      uid=$(pm list packages -U "$pkg" 2>/dev/null | tr -d '\r' | sed -n 's/.*uid:\([0-9][0-9]*\).*/\1/p' | head -n1)
+    fi
   fi
   if [ -n "$uid" ]; then
     ALLOW_ARGS="$ALLOW_ARGS $pkg:$uid"
   fi
 done
+PKG=$(pm list packages 2>/dev/null | tr -d '\r' | grep -E 'com\.resukisu\.resukisu|org\.bakasu\.bakasu' | head -n1 | cut -d: -f2)
+MGR_UID=""
+if [ -n "$PKG" ]; then
+  MGR_UID=$(stat -c '%u' "/data/user/0/$PKG" 2>/dev/null || true)
+  if [ -z "$MGR_UID" ]; then
+    MGR_UID=$(pm list packages -U "$PKG" 2>/dev/null | tr -d '\r' | sed -n 's/.*uid:\([0-9][0-9]*\).*/\1/p' | head -n1)
+  fi
+fi
+umask 022
+{
+  echo "ALLOW_ARGS='$ALLOW_ARGS'"
+  echo "PKG='$PKG'"
+  echo "MGR_UID='$MGR_UID'"
+} > /data/local/tmp/ksu-precomputed.env
+chmod 644 /data/local/tmp/ksu-precomputed.env
+echo "[*] precomputed ALLOW_ARGS=$ALLOW_ARGS"
+echo "[*] precomputed PKG=$PKG MGR_UID=$MGR_UID"
+PRECOMPUTE_SH
+
+cat > r20-root.sh << 'INNER_ROOT_SH'
+#!/system/bin/sh
+exec >>/data/local/tmp/root-helper.log 2>&1
+set -x
+id
+echo 0 > /proc/sys/kernel/kptr_restrict
+cat /proc/kallsyms > /data/local/tmp/kallsyms.txt
+/data/data/com.termux/files/usr/bin/python3 /data/local/tmp/patch_final.py
+
+# Load rish-precomputed allowlist/manager IDs, with a pre-insmod fallback
+# while /system/bin/stat and pm still work.
+ALLOW_ARGS=""
+PKG=""
+MGR_UID=""
+if [ -f /data/local/tmp/ksu-precomputed.env ]; then
+  . /data/local/tmp/ksu-precomputed.env
+fi
+if [ -z "$ALLOW_ARGS" ]; then
+  for pkg in \
+    com.termux \
+    com.resukisu.resukisu \
+    moe.shizuku.privileged.api \
+    com.polygraphene.df.installer \
+    com.polygraphene.df.reroot \
+    com.rosan.dhizuku \
+    com.android.shell \
+    foss.chillastro.root.checker.offline \
+    com.softwarebakery.drivedroid \
+    io.github.capitan0n.droynis \
+    com.hijacker \
+    su.sniff.cepter \
+    com.alexisgordr.icdetector \
+    com.merxury.blocker \
+    com.werismoln.multibooter \
+    io.github.sloppytopp.n0rma \
+    com.machiav3lli.fdroid \
+    app.fayaz.otgmaster \
+    com.emanuelef.remote_capture \
+    com.pcapdroid.mitm \
+    com.repairdeck.fixit \
+    se.norenh.rkfread \
+    org.sharkdroid \
+    org.simlar \
+    de.srlabs.snoopsnitch \
+    com.termux.gui \
+    com.termux.boot \
+    com.termux.api \
+    com.valhalla.thor \
+    eu.darken.sdmse \
+    io.github.nongfsq.usbdebugguard \
+    app.pwhs.universalinstaller
+  do
+    if [ "$pkg" = "com.android.shell" ]; then
+      uid=2000
+    else
+      uid=$(stat -c '%u' "/data/user/0/$pkg" 2>/dev/null || true)
+    fi
+    if [ -n "$uid" ]; then
+      ALLOW_ARGS="$ALLOW_ARGS $pkg:$uid"
+    fi
+  done
+fi
+if [ -z "$PKG" ]; then
+  PKG=$(pm list packages 2>/dev/null | grep -E 'com\.resukisu\.resukisu|org\.bakasu\.bakasu' | head -n1 | cut -d: -f2)
+fi
+if [ -z "$MGR_UID" ] && [ -n "$PKG" ]; then
+  MGR_UID=$(stat -c '%u' "/data/user/0/$PKG" 2>/dev/null || true)
+fi
+mkdir -p /data/adb/ksu 2>/dev/null || true
 if [ -f /data/adb/ksu/.allowlist.good ]; then
   cp -f /data/adb/ksu/.allowlist.good /data/adb/ksu/.allowlist
 elif [ -n "$ALLOW_ARGS" ]; then
   /data/data/com.termux/files/usr/bin/python3 /data/local/tmp/gen_allowlist.py /data/adb/ksu/.allowlist $ALLOW_ARGS
 fi
+echo "[*] pre-insmod ALLOW_ARGS=$ALLOW_ARGS PKG=$PKG MGR_UID=$MGR_UID"
 
-PKG=$(pm list packages | grep -E 'com\.resukisu\.resukisu|org\.bakasu\.bakasu' | head -n1 | cut -d: -f2)
+# Truncate/recreate the log BEFORE redirecting. Unlinking net-qa.log after
+# exec >>"$LOG" sends every later line to a deleted inode.
+LOG=/data/local/tmp/net-qa.log
+/system/bin/rm -f /data/local/tmp/net-qa.log /data/local/tmp/.ghostlock_ksu.status 2>/dev/null || true
+exec >>"$LOG" 2>&1
+(
+        # Isolate transition+insmod so parent exec_sid is never set
+        # Do not rm net-qa.log in here.
+# --- BEGIN PRE-EXIT BLOCK B ---
+timeout 2 /system/bin/chmod 0755 /data/local/tmp/net-recover.sh /data/local/tmp/net-watchdog.sh 2>/dev/null || true
+timeout 2 /system/bin/rm -f /data/local/tmp/net-recover.log 2>/dev/null || true
+echo "" > /proc/self/attr/exec 2>/dev/null || true
+# --- END PRE-EXIT BLOCK B ---
+/system/bin/sh -c '
+    echo u:r:vendor_modprobe:s0 > /proc/self/attr/exec
+    exec /system/bin/insmod /data/local/tmp/kernelsu_patched.ko allow_shell=1
+'
+rc=$?
+echo "" > /proc/self/attr/exec 2>/dev/null || true
+echo "[*] insmod rc=$rc"
+[ "$rc" -eq 0 ] || exit "$rc"
+)
+rc=$?
+echo "[*] insmod rc=$rc"
+[ "$rc" -eq 0 ] || exit "$rc"
+echo "=== POST-INSMOD $(date) ==="
+echo "uid=$(id -u) context=$(cat /proc/self/attr/current 2>/dev/null)"
+for p in netd wpa_supplicant rild qcrild; do echo -n "$p:"; pidof $p || echo MISSING; done
+timeout 5 dmesg | tail -n 100 || true
+timeout 5 ip link show || true
+timeout 5 ip addr show || true
+timeout 5 getprop | grep -E 'net\.|dns|ril|init' || true
+echo "=== END ==="
+
+# Apply manager UID now that the sysfs node exists; ksud late-load uses PKG
+# resolved before insmod. Radio recovery is left to net-recover.sh (Block A).
 if [ -n "$PKG" ] && [ -e /sys/module/kernelsu/parameters/ksu_debug_manager_appid ]; then
-  MGR_UID=$(stat -c '%u' "/data/user/0/$PKG" 2>/dev/null || true)
   [ -n "$MGR_UID" ] && echo "$MGR_UID" > /sys/module/kernelsu/parameters/ksu_debug_manager_appid
 fi
 
@@ -124,12 +210,6 @@ fi
 
 dmesg | tail -n 20
 chmod 644 /data/local/tmp/root-helper.log
-# Non-destructive network resync
-/system/bin/svc wifi disable 2>/dev/null || true
-/system/bin/svc data disable 2>/dev/null || true
-sleep 1
-/system/bin/svc wifi enable 2>/dev/null || true
-/system/bin/svc data enable 2>/dev/null || true
 # Make logs readable by shell
 /system/bin/chmod 0644 /data/local/tmp/net-qa.log /data/local/tmp/root-helper.log /data/local/tmp/.ghostlock_ksu.status 2>/dev/null || true
 /system/bin/sync
@@ -145,37 +225,135 @@ INNER_ROOT_SH
 cat r20-root.sh | rish -c 'cat > /data/local/tmp/a/r20-root.sh'
 rish -c "chmod 755 /data/local/tmp/a/r20-root.sh"
 
-echo "[*] Starting execution loop..."
-while true; do
-    echo "=== NEW ATTEMPT $(date) ==="
-    rish -c 'cd /data/local/tmp && ./e-r20'
-    sleep 3
-    if rish -c "grep -q 'insmod rc=0' /data/local/tmp/root-helper.log" 2>/dev/null; then
-        echo "SUCCESS! Module loaded."
-            # --- BLOCK A: Post-Load Recovery (Timeout-Wrapped rish) ---
-            LOG_FILE="/data/data/com.termux/files/home/ksu_deploy_new/block_a.log"
-            echo "[*] Executing post-load Block A... (Logs: $LOG_FILE)"
-            
-            # timeout forces deploy.sh to move on even if rish lingers
-            timeout 60 rish -c '
-            echo "=== BLOCK A START $(date) ==="
-            touch /data/local/tmp/su && chmod 755 /data/local/tmp/su
-            export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
-            cd /data/local/tmp || { echo "FATAL: cd failed"; exit 1; }
-            timeout 45 /data/local/tmp/net-recover.sh
-            echo "[-] net-recover.sh rc=$?"
-            WPID="$(timeout 2 cat /data/local/tmp/net-watchdog.pid 2>/dev/null)"
-            if [ -z "$WPID" ] || ! [ -d "/proc/$WPID" ]; then
-                nohup setsid /data/local/tmp/net-watchdog.sh </dev/null >/dev/null 2>&1 &
-                disown 2>/dev/null || true
+# Success means the kernelsu module is live AND the helper has written
+# "ready" after late-load. Do not treat a grep of "insmod rc=0" in
+# root-helper.log as the source of truth: that line is written after
+# exec >>net-qa.log, and a stale line from an earlier run must not count.
+ksu_is_ready() {
+    timeout -k 2 8 rish -c '
+        if [ -d /sys/module/kernelsu ] || lsmod | grep -q "^kernelsu"; then
+            if grep -qx ready /data/local/tmp/.ghostlock_ksu.status 2>/dev/null; then
+                exit 0
             fi
-            echo "[+] Block A complete."
-            echo "=== BLOCK A END ==="
-            ' > "$LOG_FILE" 2>&1 || true
-            
-            echo "[*] Block A returned cleanly (via timeout or completion)."
+        fi
+        exit 1
+    ' >/dev/null 2>&1
+}
+
+# e-r20 can print "[+] KernelSU module is loaded" and still not exit,
+# because leftover exploit threads keep the process (and therefore rish)
+# alive. deploy.sh must not wait on rish returning.
+stop_pid_tree() {
+    local sig="${1:--TERM}"
+    local pid="$2"
+    local child
+    [ -n "$pid" ] || return 0
+    [ -d "/proc/$pid" ] || return 0
+    if command -v pgrep >/dev/null 2>&1; then
+        for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+            stop_pid_tree "$sig" "$child"
+        done
+    fi
+    kill "$sig" "$pid" 2>/dev/null || true
+}
+
+stop_er20() {
+    local pid="$1"
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+        echo "[*] e-r20/rish still running after helper ready; stopping it so deploy.sh can exit."
+        stop_pid_tree -TERM "$pid"
+        command -v pkill >/dev/null 2>&1 && pkill -TERM -f '/data/local/tmp/e-r20' 2>/dev/null || true
+        sleep 1
+        stop_pid_tree -KILL "$pid"
+        command -v pkill >/dev/null 2>&1 && pkill -KILL -f '/data/local/tmp/e-r20' 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+echo "[*] Starting execution loop..."
+
+if ksu_is_ready; then
+    echo "[+] KernelSU is already loaded and ready; skipping exploit loop."
+else
+    ATTEMPT=0
+    MAX_ATTEMPTS=8
+    READY=0
+    while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        echo "=== NEW ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} $(date) ==="
+
+        # Bound the wait (-k so a SIGTERM-ignoring rish cannot hang us).
+        timeout -k 10 180 rish -c 'cd /data/local/tmp && ./e-r20' &
+        ER20_PID=$!
+
+        i=0
+        while [ "$i" -lt 90 ]; do
+            if ksu_is_ready; then
+                echo "[+] KernelSU module is loaded and helper is ready."
+                stop_er20 "$ER20_PID"
+                READY=1
+                break
+            fi
+            if ! kill -0 "$ER20_PID" 2>/dev/null; then
+                wait "$ER20_PID" 2>/dev/null || true
+                sleep 2
+                if ksu_is_ready; then
+                    echo "[+] KernelSU module is loaded and helper is ready."
+                    READY=1
+                else
+                    echo "[!] e-r20/rish exited before KernelSU became ready."
+                fi
+                break
+            fi
+            sleep 2
+            i=$((i + 1))
+        done
+
+        if [ "$READY" -eq 1 ]; then
             break
         fi
+
+        if kill -0 "$ER20_PID" 2>/dev/null; then
+            echo "[!] Timed out waiting for helper ready; stopping e-r20/rish."
+            stop_er20 "$ER20_PID"
+        fi
+        if ksu_is_ready; then
+            echo "[+] KernelSU module is loaded and helper is ready."
+            READY=1
+            break
+        fi
+        echo "[!] Not ready yet; retrying..."
         sleep 10
-        done
-    
+    done
+
+    if [ "$READY" -ne 1 ]; then
+        echo "[-] KernelSU did not become ready after ${MAX_ATTEMPTS} attempts." >&2
+        exit 1
+    fi
+fi
+
+# --- BLOCK A: Post-Load Recovery (Timeout-Wrapped rish) ---
+LOG_FILE="/data/data/com.termux/files/home/ksu_deploy_new/block_a.log"
+echo "[*] Executing post-load Block A... (Logs: $LOG_FILE)"
+
+# timeout -k is required: GNU timeout without -k sends SIGTERM and then
+# waits forever if rish ignores it.
+timeout -k 5 60 rish -c '
+echo "=== BLOCK A START $(date) ==="
+touch /data/local/tmp/su && chmod 755 /data/local/tmp/su
+export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
+cd /data/local/tmp || { echo "FATAL: cd failed"; exit 1; }
+timeout -k 5 45 /data/local/tmp/net-recover.sh
+echo "[-] net-recover.sh rc=$?"
+WPID="$(timeout -k 1 2 cat /data/local/tmp/net-watchdog.pid 2>/dev/null)"
+if [ -z "$WPID" ] || ! [ -d "/proc/$WPID" ]; then
+    nohup setsid /data/local/tmp/net-watchdog.sh </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+fi
+echo "[+] Block A complete."
+echo "=== BLOCK A END ==="
+' > "$LOG_FILE" 2>&1 || true
+
+echo "[*] Block A returned cleanly (via timeout or completion)."
+echo "[+] deploy.sh complete."
+exit 0
