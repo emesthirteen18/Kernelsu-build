@@ -225,14 +225,13 @@ INNER_ROOT_SH
 cat r20-root.sh | rish -c 'cat > /data/local/tmp/a/r20-root.sh'
 rish -c "chmod 755 /data/local/tmp/a/r20-root.sh"
 
-# Success means the kernelsu module is live AND the helper has written
-# "ready" after late-load. Do not treat a grep of "insmod rc=0" in
-# root-helper.log as the source of truth: that line is written after
-# exec >>net-qa.log, and a stale line from an earlier run must not count.
+# Success means the kernelsu module is live AND su actually elevates to uid=0.
+# Do NOT check .ghostlock_ksu.status because the loader deletes it right after
+# reading "ready" and printing "[+] KernelSU module is loaded".
 ksu_is_ready() {
-    timeout -k 2 8 rish -c '
+    timeout -k 2 10 rish -c '
         if [ -d /sys/module/kernelsu ] || lsmod | grep -q "^kernelsu"; then
-            if grep -qx ready /data/local/tmp/.ghostlock_ksu.status 2>/dev/null; then
+            if su -c id 2>/dev/null | grep -q "uid=0"; then
                 exit 0
             fi
         fi
@@ -286,27 +285,31 @@ else
         timeout -k 10 180 rish -c 'cd /data/local/tmp && ./e-r20' &
         ER20_PID=$!
 
-        i=0
-        while [ "$i" -lt 90 ]; do
-            if ksu_is_ready; then
-                echo "[+] KernelSU module is loaded and helper is ready."
-                stop_er20 "$ER20_PID"
-                READY=1
-                break
-            fi
+        # Do not poll rish during the initial ~25s run so we do not contend
+        # with the loader; just check if the process exited cleanly every 2s.
+        elapsed=0
+        while [ "$elapsed" -lt 180 ]; do
             if ! kill -0 "$ER20_PID" 2>/dev/null; then
                 wait "$ER20_PID" 2>/dev/null || true
                 sleep 2
                 if ksu_is_ready; then
-                    echo "[+] KernelSU module is loaded and helper is ready."
+                    echo "[+] KernelSU module is loaded and su uid=0 verified."
                     READY=1
                 else
-                    echo "[!] e-r20/rish exited before KernelSU became ready."
+                    echo "[!] Loader exited before KernelSU became ready."
                 fi
                 break
             fi
+            if [ "$elapsed" -ge 26 ] && [ $((elapsed % 6)) -eq 0 ]; then
+                if ksu_is_ready; then
+                    echo "[+] KernelSU module is loaded and su uid=0 verified."
+                    stop_er20 "$ER20_PID"
+                    READY=1
+                    break
+                fi
+            fi
             sleep 2
-            i=$((i + 1))
+            elapsed=$((elapsed + 2))
         done
 
         if [ "$READY" -eq 1 ]; then
@@ -355,5 +358,26 @@ echo "=== BLOCK A END ==="
 ' > "$LOG_FILE" 2>&1 || true
 
 echo "[*] Block A returned cleanly (via timeout or completion)."
+
+# [BOX-PATCH] Refresh manager app after root + network recovery so it never shows
+# a stale pre-root "Not installed" screen, and print a live root + network summary.
+timeout -k 5 20 rish -c '
+PKG="com.resukisu.resukisu"
+[ -f /data/local/tmp/ksu-precompute.env ] && . /data/local/tmp/ksu-precompute.env 2>/dev/null || true
+if [ -n "$PKG" ]; then
+    am force-stop "$PKG" 2>/dev/null || true
+    echo "[+] Refreshed manager app ($PKG) so it opens with live status."
+fi
+SU_ID="$(su -c id 2>/dev/null | head -n1)"
+SE_MODE="$(su -c getenforce 2>/dev/null | head -n1)"
+NET_DEV="$(ip route get 1.1.1.1 2>/dev/null | sed -n "s/.* dev \([^ ]*\).*/\1/p" | head -n1)"
+if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+    NET_STATE="online (${NET_DEV:-active})"
+else
+    NET_STATE="offline (${NET_DEV:-no route}) — check ~/ksu_deploy_new/block_a.log"
+fi
+echo "[+] Root: ${SU_ID:-unavailable} | SELinux: ${SE_MODE:-unknown} | Network: ${NET_STATE}"
+' 2>/dev/null || true
+
 echo "[+] deploy.sh complete."
 exit 0
