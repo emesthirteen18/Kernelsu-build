@@ -84,7 +84,7 @@ jobs:
             BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
               "https://api.github.com/repos/Baka-SU/BakaSU/releases?per_page=1" \
               | jq -r '.[0].tag_name // empty')
-            if [ -z "\( {BAKASU_REF}" ] || [ " \){BAKASU_REF}" = "null" ]; then
+            if [ -z "${BAKASU_REF}" ] || [ "${BAKASU_REF}" = "null" ]; then
               BAKASU_REF=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
                 "https://api.github.com/repos/Baka-SU/BakaSU/tags?per_page=1" \
                 | jq -r '.[0].name // "main"')
@@ -172,40 +172,85 @@ jobs:
 
           fn_body = text[open_brace + 1:close_brace]
 
-          # Jump past rules/cred/escape/hook/setenforce after the late-load kprobe skip.
-          # safe_late_done does not exist in BakaSU v4.2.0-rc3 init.c; it is inserted below.
-          boot_line = "\n\t\tksu_boot_completed = true;" if "ksu_boot_completed" in text else ""
-          anchor1_pat = re.compile(
+          # Surgical late-load patch for BakaSU/ReSukiSU v4.2.0-rc3:
+          #   SKIP apply_kernelsu_rules()       live sepolicy swap / AVC flush (ConnectivityService killer)
+          #   SKIP escape_to_root_for_init()    setup_selinux(KERNEL_SU_CONTEXT) on the current process SID
+          #   SKIP setenforce(true)             keep SELinux Permissive (also makes apply_kernelsu_rules unnecessary)
+          #   KEEP cache_sid(), setup_ksu_cred()  (SID cache + ksu_cred template; does not mutate current SID)
+          #   KEEP allowlist / hook / throne / observer / file_wrapper / boot_completed / track_throne
+          late_pat = re.compile(
               r'(pr_info\s*\(\s*[^;]*?"[^"]*late load mode, skipping kprobe hooks\\n"\s*\)\s*;)'
           )
-          fn_body, n1 = anchor1_pat.subn(
+          late_m = late_pat.search(fn_body)
+          assert late_m, "FATAL: late-load kprobe skip pr_info not found in kernelsu_init"
+
+          endif_m = re.search(r'\n[ \t]*#endif', fn_body[late_m.end():])
+          assert endif_m, "FATAL: #endif after late-load block not found"
+          late_start = late_m.start()
+          late_end = late_m.end() + endif_m.start()
+          late = fn_body[late_start:late_end]
+
+          late, n_info = late_pat.subn(
               lambda m: (
                   m.group(1)
-                  + '\n\t\tpr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");'
-                  + '\n\t\tpr_info("%s\\n", safe_late_load_marker);'
-                  + boot_line
-                  + '\n\t\tgoto safe_late_done;'
+                  + '\n        pr_info("SAFE_LATE_LOAD: skip rules/escape/setenforce; keep hook/throne\\n");'
+                  + '\n        pr_info("%s\\n", safe_late_load_marker);'
               ),
-              fn_body,
-              count=1
+              late,
+              count=1,
           )
-          assert n1 == 1, f"FATAL: anchor1 failed inside init function (n1={n1})"
+          assert n_info == 1, f"FATAL: failed to insert SAFE_LATE_LOAD marker (n={n_info})"
 
-          # Insert safe_late_done immediately before the FINAL return 0; of this function
-          ret_matches = list(re.finditer(r'\n([ \t]*)return\s+0\s*;', fn_body))
-          assert ret_matches, "FATAL: no return 0; found inside kernelsu_init/ksu_init"
-          last_ret = ret_matches[-1]
-          indent = last_ret.group(1)
-          fn_body = (
-              "\n\t(void)safe_late_load_marker;"
-              + fn_body[:last_ret.start()]
-              + f"\nsafe_late_done:\n{indent};"
-              + fn_body[last_ret.start():]
+          late, n_rules = re.subn(
+              r'\bapply_kernelsu_rules\s*\(\s*\)\s*;',
+              lambda m: 'pr_info("SAFE_LATE_LOAD: skipping apply_kernelsu_rules (live sepolicy swap)\\n");',
+              late,
+              count=1,
           )
+          assert n_rules == 1, f"FATAL: apply_kernelsu_rules(); not found in late-load block (n={n_rules})"
+
+          late, n_esc = re.subn(
+              r'\bescape_to_root_for_init\s*\(\s*\)\s*;',
+              lambda m: 'pr_info("SAFE_LATE_LOAD: skipping escape_to_root_for_init (current SELinux SID)\\n");',
+              late,
+              count=1,
+          )
+          assert n_esc == 1, f"FATAL: escape_to_root_for_init(); not found in late-load block (n={n_esc})"
+
+          late, n_enf = re.subn(
+              r'if\s*\(\s*!getenforce\s*\(\s*\)\s*\)\s*\{[^{}]*setenforce\s*\(\s*true\s*\)\s*;[^{}]*\}',
+              lambda m: 'pr_info("SAFE_LATE_LOAD: leaving SELinux permissive (skip setenforce)\\n");',
+              late,
+              count=1,
+          )
+          assert n_enf == 1, f"FATAL: getenforce/setenforce(true) block not found in late-load (n={n_enf})"
+
+          MUST_RUN = [
+              'cache_sid();',
+              'setup_ksu_cred();',
+              'ksu_allowlist_init();',
+              'ksu_load_allow_list();',
+              'ksu_hook_init();',
+              'ksu_throne_tracker_init();',
+              'ksu_observer_init();',
+              'ksu_file_wrapper_init();',
+              'ksu_boot_completed = true;',
+              'track_throne(TRACK_THRONE_FORCE_SYNCHRONOUS);',
+          ]
+          for call in MUST_RUN:
+              assert call in late, f"FATAL: late-load block is missing required call: {call}"
+
+          # Live calls must be gone (pr_info strings mention the names but not "name();")
+          for call in ('apply_kernelsu_rules();', 'escape_to_root_for_init();', 'setenforce(true);', 'goto safe_late_done;'):
+              assert call not in late, f"FATAL: late-load block still contains skipped call: {call}"
+
+          fn_body = fn_body[:late_start] + late + fn_body[late_end:]
+          if '(void)safe_late_load_marker;' not in fn_body:
+              fn_body = "\n    (void)safe_late_load_marker;" + fn_body
 
           global_marker = (
               '\nconst char __used __attribute__((used, section(".rodata"))) safe_late_load_marker[] = '
-              '"SAFE_LATE_LOAD: skipping rules/cred/escape/hook init";\n\n'
+              '"SAFE_LATE_LOAD: skip rules/escape/setenforce; keep hook/throne";\n\n'
           )
           text = (
               text[:fn_match.start()]
@@ -214,22 +259,84 @@ jobs:
               + fn_body
               + text[close_brace:]
           )
-          assert 'goto safe_late_done;' in text, "FATAL: goto safe_late_done; missing after patch"
-          assert 'pr_info("SAFE_LATE_LOAD: skipping rules/cred/escape/hook init\\n");' in text
           p.write_text(text)
+          print("PASS: SAFE_LATE_LOAD surgical patch applied to", p)
           PY_PATCH_INIT
 
-          # Fail-fast: the skip must be a real jump, not just a marker string
-          if ! grep -Fq 'goto safe_late_done;' "$INIT_C"; then
-            echo "FATAL: SAFE_LATE_LOAD regression: init.c is missing 'goto safe_late_done;'"
-            exit 1
-          fi
-          if ! grep -Fq "safe_late_done:" "$INIT_C"; then
-            echo "FATAL: SAFE_LATE_LOAD regression: init.c is missing label safe_late_done:"
-            exit 1
-          fi
-          echo "PASS: SAFE_LATE_LOAD skip is present (goto safe_late_done;)"
+          # Fail-fast CI assertion: re-parse patched init.c and check keep vs skip
+          python3 - "$INIT_C" <<'PY_ASSERT_INIT'
+          import re, sys, pathlib
+          text = pathlib.Path(sys.argv[1]).read_text()
+          fn_match = re.search(r'int\s+__init\s+(?:kernelsu_init|ksu_init)\s*\([^)]*\)\s*\{', text)
+          assert fn_match, "FATAL: kernelsu_init/ksu_init signature not found after patch"
+          open_brace = text.find('{', fn_match.start())
+          depth = 0
+          close_brace = -1
+          for idx in range(open_brace, len(text)):
+              if text[idx] == '{':
+                  depth += 1
+              elif text[idx] == '}':
+                  depth -= 1
+                  if depth == 0:
+                      close_brace = idx
+                      break
+          fn_body = text[open_brace + 1:close_brace]
+          late_m = re.search(
+              r'pr_info\s*\(\s*[^;]*?"[^"]*late load mode, skipping kprobe hooks\\n"\s*\)\s*;',
+              fn_body,
+          )
+          assert late_m, "FATAL: late-load kprobe skip pr_info missing after patch"
+          endif_m = re.search(r'\n[ \t]*#endif', fn_body[late_m.end():])
+          assert endif_m, "FATAL: late-load #endif missing after patch"
+          late = fn_body[late_m.start(): late_m.end() + endif_m.start()]
 
+          must_run = [
+              'cache_sid();',
+              'setup_ksu_cred();',
+              'ksu_allowlist_init();',
+              'ksu_load_allow_list();',
+              'ksu_hook_init();',
+              'ksu_throne_tracker_init();',
+              'ksu_observer_init();',
+              'ksu_file_wrapper_init();',
+              'ksu_boot_completed = true;',
+              'track_throne(TRACK_THRONE_FORCE_SYNCHRONOUS);',
+          ]
+          must_skip = [
+              'apply_kernelsu_rules();',
+              'escape_to_root_for_init();',
+              'setenforce(true);',
+              'goto safe_late_done;',
+          ]
+          must_markers = [
+              'SAFE_LATE_LOAD: skip rules/escape/setenforce; keep hook/throne',
+              'SAFE_LATE_LOAD: skipping apply_kernelsu_rules (live sepolicy swap)',
+              'SAFE_LATE_LOAD: skipping escape_to_root_for_init (current SELinux SID)',
+              'SAFE_LATE_LOAD: leaving SELinux permissive (skip setenforce)',
+          ]
+          failed = False
+          for call in must_run:
+              if call not in late:
+                  print(f"FATAL: required late-load call missing: {call}")
+                  failed = True
+              else:
+                  print(f"KEEP: {call}")
+          for call in must_skip:
+              if call in late:
+                  print(f"FATAL: skipped late-load call still present: {call}")
+                  failed = True
+              else:
+                  print(f"SKIP: {call}")
+          for marker in must_markers:
+              if marker not in text:
+                  print(f"FATAL: expected marker missing: {marker}")
+                  failed = True
+              else:
+                  print(f"MARK: {marker}")
+          if failed:
+              sys.exit(1)
+          print("PASS: SAFE_LATE_LOAD surgical asserts (keep hook/throne, skip rules/escape/setenforce)")
+          PY_ASSERT_INIT
 
           python3 - << 'PY_PATCH_ABI'
           import re, sys
