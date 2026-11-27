@@ -454,7 +454,7 @@ echo "[*] Executing post-load Block A... (Logs: $LOG_FILE)"
 timeout -k 5 60 rish -c '
 echo "=== BLOCK A START $(date) ==="
 touch /data/local/tmp/su && chmod 755 /data/local/tmp/su
-export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
+export PATH="/system/bin:/system/xbin:/vendor/bin:/data/local/tmp:$PATH"
 cd /data/local/tmp || { echo "FATAL: cd failed"; exit 1; }
 timeout -k 5 45 /data/local/tmp/net-recover.sh
 echo "[-] net-recover.sh rc=$?"
@@ -478,7 +478,7 @@ if [ -n "$PKG" ]; then
     am force-stop "$PKG" 2>/dev/null || true
     echo "[+] Refreshed manager app ($PKG) so it opens with live status."
 fi
-export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
+export PATH="/system/bin:/system/xbin:/vendor/bin:/data/local/tmp:$PATH"
 SU_ID="$(su -c id 2>/dev/null | head -n1)"
 SE_MODE="$(su -c getenforce 2>/dev/null | head -n1)"
 NET_DEV="$(ip route get 1.1.1.1 2>/dev/null | sed -n "s/.* dev \([^ ]*\).*/\1/p" | head -n1)"

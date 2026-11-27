@@ -39,7 +39,7 @@ cmd_status() {
     esac
     echo "Shizuku:   ok"
     timeout -k 3 15 rish -c '
-export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
+export PATH="/system/bin:/system/xbin:/vendor/bin:/data/local/tmp:$PATH"
 if [ -d /sys/module/kernelsu ] || lsmod 2>/dev/null | grep -q "^kernelsu"; then
     echo "KernelSU:  loaded"
 else
@@ -77,7 +77,7 @@ fi
 
 cmd_modules() {
     timeout -k 3 15 rish -c '
-export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
+export PATH="/system/bin:/system/xbin:/vendor/bin:/data/local/tmp:$PATH"
 su -c "/data/local/tmp/ksud module list" 2>/dev/null
 ' </dev/null 2>&1 | python3 -c '
 import json, sys
@@ -105,7 +105,7 @@ for m in mods:
 
 cmd_refresh() {
     timeout -k 3 15 rish -c '
-export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
+export PATH="/system/bin:/system/xbin:/vendor/bin:/data/local/tmp:$PATH"
 su -c "/data/local/tmp/ksud debug mark refresh" >/dev/null 2>&1 || true
 am force-stop com.resukisu.resukisu 2>/dev/null || true
 echo "[+] Refreshed ksud marks and force-stopped com.resukisu.resukisu."
@@ -114,7 +114,7 @@ echo "[+] Refreshed ksud marks and force-stopped com.resukisu.resukisu."
 
 cmd_net() {
     timeout -k 5 50 rish -c '
-export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
+export PATH="/system/bin:/system/xbin:/vendor/bin:/data/local/tmp:$PATH"
 if [ -x /data/local/tmp/net-recover.sh ]; then
     /data/local/tmp/net-recover.sh
 else
