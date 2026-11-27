@@ -29,7 +29,8 @@ cmd_status() {
     else
         echo "Bridge:    stopped"
     fi
-    if ! timeout -k 2 10 rish -c 'echo ok' 2>/dev/null | grep -q '^ok$'; then
+    RISH_CHK="$(timeout -k 2 10 rish -c 'echo ok' </dev/null 2>/dev/null | tr -d '\r\n' || true)"
+if [ "$RISH_CHK" != "ok" ]; then
         echo "Shizuku:   NOT RESPONDING"
         return 1
     fi
@@ -91,7 +92,9 @@ if not mods:
     sys.exit(0)
 for m in mods:
     state = "enabled" if str(m.get("enabled")).lower() == "true" else "disabled"
-    print(f"- {m.get(\"name\", m.get(\"id\", \"?\"))} ({m.get(\"version\", \"?\")}) [{state}]")
+    name = m.get("name") or m.get("id") or "?"
+    ver = m.get("version") or "?"
+    print(f"- {name} ({ver}) [{state}]")
 '
 }
 
