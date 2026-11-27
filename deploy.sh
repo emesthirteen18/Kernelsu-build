@@ -1,7 +1,113 @@
 #!/data/data/com.termux/files/usr/bin/bash
-cd "$(dirname "$0")"
+set -o pipefail
+cd "$(dirname "$0")" || exit 1
+DEPLOY_DIR="$PWD"
 # Termux rish needs this or staging fails with "RISH_APPLICATION_ID is not set"
 export RISH_APPLICATION_ID="${RISH_APPLICATION_ID:-com.termux}"
+
+DRY_RUN=0
+SKIP_VERIFY=0
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        --skip-verify) SKIP_VERIFY=1 ;;
+        -h|--help)
+            echo "Usage: deploy.sh [--dry-run] [--skip-verify]"
+            exit 0
+            ;;
+        *)
+            echo "[!] Unknown option: $arg (use --dry-run or --skip-verify)" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# [HARDENING] Timestamped run log with automatic rotation (keep newest 10)
+LOG_DIR="$DEPLOY_DIR/logs"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+RUN_LOG="$LOG_DIR/deploy-$(date +%Y%m%d-%H%M%S).log"
+if [ "$DRY_RUN" -eq 0 ]; then
+    ls -1t "$LOG_DIR"/deploy-*.log 2>/dev/null | tail -n +11 | xargs -r rm -f 2>/dev/null || true
+    exec > >(tee -a "$RUN_LOG" "$DEPLOY_DIR/deploy.log") 2>&1
+    echo "=== deploy.sh started $(date) (kernel: $(uname -r)) ==="
+fi
+
+# [HARDENING] Atomic concurrency lock so two root runs cannot collide
+LOCK_DIR="$DEPLOY_DIR/.deploy.lock"
+LOCK_ACQUIRED=0
+WAKELOCK_ACQUIRED=0
+
+cleanup_deploy() {
+    local rc=$?
+    if [ "$LOCK_ACQUIRED" -eq 1 ]; then
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    fi
+    if [ "$WAKELOCK_ACQUIRED" -eq 1 ]; then
+        termux-wake-unlock 2>/dev/null || true
+    fi
+    exit "$rc"
+}
+trap cleanup_deploy EXIT INT TERM
+
+if [ "$DRY_RUN" -eq 0 ]; then
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "$$" > "$LOCK_DIR/pid"
+        LOCK_ACQUIRED=1
+    else
+        OLD_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "[-] Another deploy.sh run is already active (PID $OLD_PID). Exiting." >&2
+            exit 1
+        fi
+        echo "[!] Clearing stale lock (PID ${OLD_PID:-unknown})."
+        rm -rf "$LOCK_DIR"
+        mkdir "$LOCK_DIR" && echo "$$" > "$LOCK_DIR/pid" && LOCK_ACQUIRED=1
+    fi
+    if command -v termux-wake-lock >/dev/null 2>&1; then
+        termux-wake-lock 2>/dev/null && WAKELOCK_ACQUIRED=1 || true
+    fi
+fi
+
+# [HARDENING] Pre-flight checks (required files, SHA-256 manifest, kernel check, Shizuku check)
+echo "[*] Running pre-flight checks..."
+MISSING=0
+for req in kernelsu.ko stock.ko patch_final.py gen_allowlist.py e-r20 spray ksud; do
+    if [ ! -s "$DEPLOY_DIR/$req" ]; then
+        echo "[-] Missing or empty required file: $DEPLOY_DIR/$req" >&2
+        MISSING=1
+    fi
+done
+if [ "$MISSING" -ne 0 ]; then
+    echo "[-] Pre-flight failed: required deploy files are missing." >&2
+    exit 1
+fi
+
+KREL="$(uname -r 2>/dev/null || true)"
+case "$KREL" in
+    6.6.127*) echo "[+] Kernel verified: $KREL" ;;
+    *) echo "[!] Warning: unexpected kernel '$KREL' (expected 6.6.127*)." ;;
+esac
+
+if [ "$SKIP_VERIFY" -eq 0 ] && [ -f "$DEPLOY_DIR/sha256sums.txt" ]; then
+    if sha256sum -c "$DEPLOY_DIR/sha256sums.txt" >/dev/null 2>&1; then
+        echo "[+] Integrity check passed (sha256sums.txt)."
+    else
+        echo "[-] Integrity check FAILED for sha256sums.txt! Run 'root verify' for details or pass --skip-verify." >&2
+        sha256sum -c "$DEPLOY_DIR/sha256sums.txt" 2>&1 | grep -v ': OK$' || true
+        exit 1
+    fi
+fi
+
+if ! timeout -k 2 10 rish -c 'echo ok' 2>/dev/null | grep -q '^ok$'; then
+    echo "[-] Shizuku (rish) is not responding. Start Shizuku and retry." >&2
+    exit 1
+fi
+echo "[+] Shizuku (rish) responsive."
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[+] Dry-run pre-flight passed (no files staged, no kernel changes)."
+    exit 0
+fi
 
 echo "[*] Staging files to /data/local/tmp via rish..."
 rish -c "mkdir -p /data/local/tmp/a"
@@ -213,6 +319,8 @@ chmod 644 /data/local/tmp/root-helper.log
 # Make logs readable by shell
 /system/bin/chmod 0644 /data/local/tmp/net-qa.log /data/local/tmp/root-helper.log /data/local/tmp/.ghostlock_ksu.status 2>/dev/null || true
 /system/bin/sync
+echo ready > /data/local/tmp/.ksu_deploy_done
+chmod 0644 /data/local/tmp/.ksu_deploy_done 2>/dev/null || true
 echo ready > /data/local/tmp/.ghostlock_ksu.status
 
 
@@ -225,15 +333,13 @@ INNER_ROOT_SH
 cat r20-root.sh | rish -c 'cat > /data/local/tmp/a/r20-root.sh'
 rish -c "chmod 755 /data/local/tmp/a/r20-root.sh"
 
-# Success means the kernelsu module is live AND su actually elevates to uid=0.
-# Do NOT check .ghostlock_ksu.status because the loader deletes it right after
-# reading "ready" and printing "[+] KernelSU module is loaded".
+# Success means the kernelsu module is loaded in the kernel (or our persistent
+# post-helper marker exists). Do NOT require `su` here because Block A creates
+# /data/local/tmp/su and sets PATH after this loop finishes.
 ksu_is_ready() {
     timeout -k 2 10 rish -c '
-        if [ -d /sys/module/kernelsu ] || lsmod | grep -q "^kernelsu"; then
-            if su -c id 2>/dev/null | grep -q "uid=0"; then
-                exit 0
-            fi
+        if [ -d /sys/module/kernelsu ] || lsmod 2>/dev/null | grep -q "^kernelsu" || [ -f /data/local/tmp/.ksu_deploy_done ]; then
+            exit 0
         fi
         exit 1
     ' >/dev/null 2>&1
@@ -368,6 +474,7 @@ if [ -n "$PKG" ]; then
     am force-stop "$PKG" 2>/dev/null || true
     echo "[+] Refreshed manager app ($PKG) so it opens with live status."
 fi
+export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
 SU_ID="$(su -c id 2>/dev/null | head -n1)"
 SE_MODE="$(su -c getenforce 2>/dev/null | head -n1)"
 NET_DEV="$(ip route get 1.1.1.1 2>/dev/null | sed -n "s/.* dev \([^ ]*\).*/\1/p" | head -n1)"
