@@ -1,0 +1,78 @@
+name: dfroot-custom
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/dfroot-custom.yml'
+      - 'lkm/**'
+      - 'scripts/patch_ko.py'
+
+env:
+  ARCH: arm64
+  CLANG_REVISION: r510928
+  KERNEL_REPO: NothingOSS/android_kernel_msm-6.6_nothing_sm7750
+  KERNEL_REF: sm7750/b/FroggerPro
+  VERMAGIC: '6.6.127-android15-8-g1a9b880d342b-ab15218529-4k SMP preempt mod_unload modversions aarch64'
+  MODULE_LAYOUT_CRC: '0x4e276f37'
+
+jobs:
+  build-dfroot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
+
+      - name: Checkout kernel
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_REF }}
+          path: kernel_source
+
+      - name: Checkout this repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: workspace-repo
+
+      - name: Download Clang r510928
+        run: |
+          set -euo pipefail
+          curl -L -o clang.zip https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip
+          unzip -q clang.zip -d clang
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Configure kernel
+        working-directory: kernel_source
+        run: |
+          set -euo pipefail
+          make ARCH=arm64 LLVM=1 gki_defconfig
+          scripts/config --set-str LOCALVERSION "-android15-8-g1a9b880d342b-ab15218529-4k"
+          make ARCH=arm64 LLVM=1 olddefconfig
+          make ARCH=arm64 LLVM=1 modules_prepare
+
+      - name: Build dfroot.ko
+        working-directory: kernel_source
+        run: |
+          set -euo pipefail
+          cp -a ../workspace-repo/lkm .
+          make -C . M=lkm ARCH=arm64 LLVM=1 modules
+          llvm-objcopy --strip-unneeded \
+            -R .comment -R .note.gnu.build-id -R .note.gnu.property \
+            -R .note.Linux -R .note.GNU-stack \
+            -R .BTF -R .BTF.base -R .llvm_addrsig \
+            lkm/dfroot.ko
+
+      - name: Patch vermagic, __versions, and neutralize text-patching sections
+        run: |
+          set -euo pipefail
+          python3 workspace-repo/scripts/patch_ko.py kernel_source/lkm/dfroot.ko
+          strings kernel_source/lkm/dfroot.ko.patched | grep -F "6.6.127-android15-8-g1a9b880d342b-ab15218529-4k" || { echo "FATAL: vermagic missing"; exit 1; }
+          echo "PASS: vermagic present"
+
+      - name: Upload dfroot.ko
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
+        with:
+          name: dfroot-ko
+          path: kernel_source/lkm/dfroot.ko.patched
