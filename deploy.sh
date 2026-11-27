@@ -337,16 +337,19 @@ INNER_ROOT_SH
 cat r20-root.sh | rish -c 'cat > /data/local/tmp/a/r20-root.sh'
 rish -c "chmod 755 /data/local/tmp/a/r20-root.sh"
 
-# Success means the kernelsu module is loaded in the kernel (or our persistent
-# post-helper marker exists). Do NOT require `su` here because Block A creates
-# /data/local/tmp/su and sets PATH after this loop finishes.
+# Success means the kernelsu module is loaded in the kernel AND either su uid=0
+# answers directly (zero-rish fast path — avoids Shizuku contention while e-r20
+# holds a rish session) or our persistent post-helper marker exists.
 ksu_is_ready() {
-    timeout -k 2 10 rish -c '
-        if [ -d /sys/module/kernelsu ] || lsmod 2>/dev/null | grep -q "^kernelsu" || [ -f /data/local/tmp/.ksu_deploy_done ]; then
-            exit 0
+    if [ -d /sys/module/kernelsu ] || grep -q '^kernelsu ' /proc/modules 2>/dev/null; then
+        if timeout -k 2 5 /system/bin/su -c 'id -u' 2>/dev/null | grep -qx '0'; then
+            return 0
         fi
-        exit 1
-    ' >/dev/null 2>&1
+        if timeout -k 2 8 rish -c '[ -f /data/local/tmp/.ksu_deploy_done ]' >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # e-r20 can print "[+] KernelSU module is loaded" and still not exit,
