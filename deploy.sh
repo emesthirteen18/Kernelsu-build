@@ -28,7 +28,7 @@ mkdir -p "$LOG_DIR" 2>/dev/null || true
 RUN_LOG="$LOG_DIR/deploy-$(date +%Y%m%d-%H%M%S).log"
 if [ "$DRY_RUN" -eq 0 ]; then
     ls -1t "$LOG_DIR"/deploy-*.log 2>/dev/null | tail -n +11 | xargs -r rm -f 2>/dev/null || true
-    exec > >(tee -a "$RUN_LOG" "$DEPLOY_DIR/deploy.log") 2>&1
+    exec > >(grep --line-buffered -v "^Waiting for Shizuku authorization" | tee -a "$RUN_LOG" "$DEPLOY_DIR/deploy.log") 2>&1
     echo "=== deploy.sh started $(date) (kernel: $(uname -r)) ==="
 fi
 
@@ -325,6 +325,8 @@ chmod 644 /data/local/tmp/root-helper.log
 /system/bin/sync
 echo ready > /data/local/tmp/.ksu_deploy_done
 chmod 0644 /data/local/tmp/.ksu_deploy_done 2>/dev/null || true
+echo ready > /data/data/com.termux/files/home/ksu_deploy_new/.ksu_deploy_done 2>/dev/null || true
+chmod 0644 /data/data/com.termux/files/home/ksu_deploy_new/.ksu_deploy_done 2>/dev/null || true
 echo ready > /data/local/tmp/.ghostlock_ksu.status
 
 
@@ -337,15 +339,15 @@ INNER_ROOT_SH
 cat r20-root.sh | rish -c 'cat > /data/local/tmp/a/r20-root.sh'
 rish -c "chmod 755 /data/local/tmp/a/r20-root.sh"
 
-# Success means the kernelsu module is loaded in the kernel AND either su uid=0
-# answers directly (zero-rish fast path — avoids Shizuku contention while e-r20
-# holds a rish session) or our persistent post-helper marker exists.
+# Pure local readiness check (zero rish calls -> never contends with e-r20's rish):
+# True once the kernelsu module is loaded AND either our helper wrote the
+# Termux-readable .ksu_deploy_done marker or /system/bin/su answers uid=0.
 ksu_is_ready() {
     if [ -d /sys/module/kernelsu ] || grep -q '^kernelsu ' /proc/modules 2>/dev/null; then
-        if timeout -k 2 5 /system/bin/su -c 'id -u' 2>/dev/null | grep -qx '0'; then
+        if [ -f "$DEPLOY_DIR/.ksu_deploy_done" ]; then
             return 0
         fi
-        if timeout -k 2 8 rish -c '[ -f /data/local/tmp/.ksu_deploy_done ]' >/dev/null 2>&1; then
+        if timeout -k 2 3 /system/bin/su -c 'id -u' </dev/null 2>/dev/null | grep -qx '0'; then
             return 0
         fi
     fi
@@ -384,9 +386,11 @@ stop_er20() {
 
 echo "[*] Starting execution loop..."
 
-if ksu_is_ready; then
+# Pre-loop check: also honor /data/local/tmp/.ksu_deploy_done if already loaded before this run
+if ksu_is_ready || ( ([ -d /sys/module/kernelsu ] || grep -q '^kernelsu ' /proc/modules 2>/dev/null) && timeout -k 2 8 rish -c '[ -f /data/local/tmp/.ksu_deploy_done ]' </dev/null >/dev/null 2>&1 ); then
     echo "[+] KernelSU is already loaded and ready; skipping exploit loop."
 else
+    rm -f "$DEPLOY_DIR/.ksu_deploy_done" 2>/dev/null || true
     ATTEMPT=0
     MAX_ATTEMPTS=8
     READY=0
@@ -394,28 +398,27 @@ else
         ATTEMPT=$((ATTEMPT + 1))
         echo "=== NEW ATTEMPT ${ATTEMPT}/${MAX_ATTEMPTS} $(date) ==="
 
-        # Bound the wait (-k so a SIGTERM-ignoring rish cannot hang us).
-        timeout -k 10 180 rish -c 'cd /data/local/tmp && ./e-r20' &
+        # Bound the wait (-k so a SIGTERM-ignoring rish cannot hang us); detach stdin from TTY.
+        timeout -k 10 180 rish -c 'cd /data/local/tmp && ./e-r20' </dev/null &
         ER20_PID=$!
 
-        # Do not poll rish during the initial ~25s run so we do not contend
-        # with the loader; just check if the process exited cleanly every 2s.
+        # Poll local ksu_is_ready() (zero rish contention) every 2s starting at 10s.
         elapsed=0
         while [ "$elapsed" -lt 180 ]; do
             if ! kill -0 "$ER20_PID" 2>/dev/null; then
                 wait "$ER20_PID" 2>/dev/null || true
                 sleep 2
                 if ksu_is_ready; then
-                    echo "[+] KernelSU module is loaded and su uid=0 verified."
+                    echo "[+] KernelSU module is loaded and helper finished."
                     READY=1
                 else
                     echo "[!] Loader exited before KernelSU became ready."
                 fi
                 break
             fi
-            if [ "$elapsed" -ge 26 ] && [ $((elapsed % 6)) -eq 0 ]; then
+            if [ "$elapsed" -ge 10 ]; then
                 if ksu_is_ready; then
-                    echo "[+] KernelSU module is loaded and su uid=0 verified."
+                    echo "[+] KernelSU module is loaded and helper finished."
                     stop_er20 "$ER20_PID"
                     READY=1
                     break
@@ -468,7 +471,7 @@ if [ -z "$WPID" ] || ! [ -d "/proc/$WPID" ]; then
 fi
 echo "[+] Block A complete."
 echo "=== BLOCK A END ==="
-' > "$LOG_FILE" 2>&1 || true
+' </dev/null > "$LOG_FILE" 2>&1 || true
 
 echo "[*] Block A returned cleanly (via timeout or completion)."
 
@@ -491,7 +494,7 @@ else
     NET_STATE="offline (${NET_DEV:-no route}) — check ~/ksu_deploy_new/block_a.log"
 fi
 echo "[+] Root: ${SU_ID:-unavailable} | SELinux: ${SE_MODE:-unknown} | Network: ${NET_STATE}"
-' 2>/dev/null || true
+' </dev/null 2>/dev/null || true
 
 echo "[+] deploy.sh complete."
 exit 0
