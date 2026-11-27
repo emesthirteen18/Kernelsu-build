@@ -29,11 +29,14 @@ cmd_status() {
     else
         echo "Bridge:    stopped"
     fi
-    RISH_CHK="$(timeout -k 2 10 rish -c 'echo ok' </dev/null 2>/dev/null | tr -d '\r\n' || true)"
-if [ "$RISH_CHK" != "ok" ]; then
-        echo "Shizuku:   NOT RESPONDING"
-        return 1
-    fi
+    RISH_CHK="$(timeout -k 2 10 rish -c 'echo __RISH_OK__' </dev/null 2>&1 || true)"
+    case "$RISH_CHK" in
+        *__RISH_OK__*) ;;
+        *)
+            echo "Shizuku:   NOT RESPONDING"
+            return 1
+            ;;
+    esac
     echo "Shizuku:   ok"
     timeout -k 3 15 rish -c '
 export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
@@ -69,16 +72,18 @@ if [ -n "$WPID" ] && [ -d "/proc/$WPID" ]; then
 else
     echo "Watchdog:  not running"
 fi
-' 2>/dev/null
+' </dev/null 2>&1 | grep -v '^Waiting for Shizuku authorization' || true
 }
 
 cmd_modules() {
     timeout -k 3 15 rish -c '
 export PATH="/data/local/tmp:/system/bin:/system/xbin:/vendor/bin:$PATH"
 su -c "/data/local/tmp/ksud module list" 2>/dev/null
-' 2>/dev/null | python3 -c '
+' </dev/null 2>&1 | python3 -c '
 import json, sys
-raw = sys.stdin.read().strip()
+raw = sys.stdin.read()
+idx = raw.find("[")
+raw = raw[idx:].strip() if idx != -1 else ""
 if not raw:
     print("No modules returned (is KernelSU loaded?)")
     sys.exit(1)

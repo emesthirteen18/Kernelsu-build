@@ -98,11 +98,14 @@ if [ "$SKIP_VERIFY" -eq 0 ] && [ -f "$DEPLOY_DIR/sha256sums.txt" ]; then
     fi
 fi
 
-RISH_CHK="$(timeout -k 2 10 rish -c 'echo ok' </dev/null 2>/dev/null | tr -d '\r\n' || true)"
-if [ "$RISH_CHK" != "ok" ]; then
-    echo "[-] Shizuku (rish) is not responding. Start Shizuku and retry." >&2
-    exit 1
-fi
+RISH_CHK="$(timeout -k 2 10 rish -c 'echo __RISH_OK__' </dev/null 2>&1 || true)"
+case "$RISH_CHK" in
+    *__RISH_OK__*) ;;
+    *)
+        echo "[-] Shizuku (rish) is not responding. Start Shizuku and retry." >&2
+        exit 1
+        ;;
+esac
 echo "[+] Shizuku (rish) responsive."
 
 if [ "$DRY_RUN" -eq 1 ]; then
